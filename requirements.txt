@@ -1,0 +1,5 @@
+httpx==0.28.1
+selectolax==0.4.12
+protego==0.7.0
+openpyxl==3.1.5
+pytest==9.1.1
