@@ -62,7 +62,7 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-89 tests, all run in-process against private `FixtureServer` instances
+107 tests, all run in-process against private `FixtureServer` instances
 on ephemeral loopback ports (or an in-process `httpx.MockTransport` for
 a few boundary-only cases) — no shared state between tests, nothing
 left running afterwards. Runtime is ~70s, dominated by tests that
