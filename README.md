@@ -1,7 +1,6 @@
 # authorised-catalogue-extraction
 
-**Synthetic portfolio demonstration, implemented with AI coding agents;
-independent review pending. No client data or client work.**
+**Independent review:** cleared by the company's reviewer at commit a1d4a6c (scope: bounded local demo; owned synthetic catalogue, explicit scope/permission and separate robots checks). Later commits are not covered by that review.
 
 A web scraper that extracts a product catalogue into structured rows
 and monitors it for changes between runs — built and tested only
