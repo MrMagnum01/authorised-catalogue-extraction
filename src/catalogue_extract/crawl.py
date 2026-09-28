@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import PARSER_VERSION
-from .boundary import Scope, canonical_url, is_in_scope, normalize_path
+from .boundary import BoundaryError, Scope, canonical_url, check_in_scope, is_in_scope, normalize_path
 from .fetch import FetchResult, fetch_resource
 from .models import PageOutcome, Product, RawProductRecord
 from .parse import parse_detail, parse_listing
@@ -52,6 +53,7 @@ class CrawlConfig:
     max_redirects: int = 5
     max_attempts_per_url: int = 5
     retry_budget_s: float = 120.0
+    rng_seed: Optional[int] = None
 
 
 @dataclass
@@ -101,7 +103,7 @@ class CrawlResult:
 def _control_fetch(
     client: httpx.Client, url: str, scope: Scope,
     rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
-    allowed_exact_paths: frozenset,
+    allowed_exact_paths: frozenset, rng: random.Random,
 ) -> FetchResult:
     """Guarded single-attempt fetch for permission/robots/snapshot-meta:
     exact-origin boundary check, shared pacing, response-size cap and a
@@ -121,7 +123,7 @@ def _control_fetch(
         max_response_bytes=config.max_response_bytes,
         connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
         user_agent=config.user_agent, require_prefix=False,
-        allowed_exact_paths=allowed_exact_paths,
+        allowed_exact_paths=allowed_exact_paths, rng=rng,
     )
 
 
@@ -176,7 +178,8 @@ def run_crawl(
     crawl_id = uuid.uuid4().hex[:12]
     started_at = _now_iso()
     accounting = Accounting()
-    rate_limiter = RateLimiter(config.min_interval_s, config.jitter_s)
+    rng = random.Random(config.rng_seed) if config.rng_seed is not None else random.Random()
+    rate_limiter = RateLimiter(config.min_interval_s, config.jitter_s, rng=rng)
     retry_budget = RetryBudget(config.retry_budget_s)
     control_paths = frozenset(
         normalize_path(urlsplit(u).path or "/")
@@ -195,7 +198,7 @@ def run_crawl(
 
     # --- Permission: a validated grant, not just a 200 status. ---
     accounting.control_requests += 1
-    presp = _control_fetch(client, permission_url, scope, rate_limiter, retry_budget, config, control_paths)
+    presp = _control_fetch(client, permission_url, scope, rate_limiter, retry_budget, config, control_paths, rng)
     if not presp.ok:
         return refuse([f"permission_{_control_failure_reason(presp)}"])
     permission_sha256 = hashlib.sha256(presp.content).hexdigest()
@@ -220,7 +223,7 @@ def run_crawl(
     accounting.control_requests += 1
     robots_fetched_at = _now_iso()
     robots = _robots_from_control_fetch(
-        _control_fetch(client, robots_url, scope, rate_limiter, retry_budget, config, control_paths), robots_fetched_at,
+        _control_fetch(client, robots_url, scope, rate_limiter, retry_budget, config, control_paths, rng), robots_fetched_at,
     )
     if not robots.ok:
         return refuse([f"robots_{robots.reason}"],
@@ -230,7 +233,7 @@ def run_crawl(
 
     # --- Snapshot metadata: typed, required, used for completeness reconciliation. ---
     accounting.control_requests += 1
-    start_snapshot, start_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths)
+    start_snapshot, start_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths, rng)
     if start_snapshot is None:
         return refuse([f"snapshot_meta_{start_err}"],
                        permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
@@ -240,10 +243,28 @@ def run_crawl(
     pages: dict[str, PageOutcome] = {}
     out_of_scope: set = set()
     required_out_of_scope: set = set()
+    cyclic_next_links: set = set()
     raw_products: list[RawProductRecord] = []
-    queue: list[tuple] = [(seed_listing_url, "listing")]
-    queued_canon = {canonical_url(seed_listing_url)}
     page_limit_hit = False
+    queue: list[tuple] = []
+    queued_canon: set = set()
+
+    # The seed is external input like any other candidate URL: it must be
+    # validated against scope *before* canonicalization/url joining, not
+    # after — `canonical_url` parses the port with no BoundaryError
+    # conversion (unlike `check_in_scope`), so a malformed seed port would
+    # otherwise raise a bare, uncategorized ValueError straight out of this
+    # function instead of a normal, accounted-for failed page.
+    try:
+        check_in_scope(seed_listing_url, scope)
+    except BoundaryError as e:
+        pages[seed_listing_url] = PageOutcome(
+            url=seed_listing_url, canonical_url=seed_listing_url, kind="listing",
+            outcome="failed", reason=f"boundary:{e.reason}",
+        )
+    else:
+        queue.append((seed_listing_url, "listing"))
+        queued_canon.add(canonical_url(seed_listing_url))
 
     while queue:
         url, kind = queue.pop(0)
@@ -264,7 +285,7 @@ def run_crawl(
             max_attempts=config.max_attempts_per_url, max_redirects=config.max_redirects,
             max_response_bytes=config.max_response_bytes,
             connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
-            user_agent=config.user_agent, robots=robots,
+            user_agent=config.user_agent, robots=robots, rng=rng,
         )
 
         if not result.ok:
@@ -305,6 +326,14 @@ def run_crawl(
                     if c not in queued_canon:
                         queued_canon.add(c)
                         queue.append((abs_next, "listing"))
+                    else:
+                        # A required next-page link pointing back at itself
+                        # or at an already-seen listing page is a pagination
+                        # cycle, not a benign duplicate reference (unlike the
+                        # product links above, which legitimately recur
+                        # across listing pages) — the crawl never reached a
+                        # natural end, so it cannot be reported complete.
+                        cyclic_next_links.add(abs_next)
                 else:
                     out_of_scope.add(abs_next)
                     required_out_of_scope.add(abs_next)
@@ -337,7 +366,7 @@ def run_crawl(
     accounting.discovered_in_scope = len(pages)
 
     accounting.control_requests += 1
-    end_snapshot, end_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths)
+    end_snapshot, end_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths, rng)
 
     products, rejected, conflicting, exact_dup_count = _resolve_products(raw_products)
 
@@ -356,6 +385,8 @@ def run_crawl(
         reasons.append("robots_denied_pages")
     if required_out_of_scope:
         reasons.append("required_link_out_of_scope")
+    if cyclic_next_links:
+        reasons.append("required_link_cycle")
     if end_snapshot is None or start_snapshot != end_snapshot:
         reasons.append("snapshot_changed_mid_crawl" if end_err is None else f"snapshot_meta_{end_err}")
 
@@ -399,9 +430,9 @@ def _validate_snapshot_meta(meta: object) -> Optional[str]:
 def _fetch_snapshot_meta(
     client: httpx.Client, url: str, scope: Scope,
     rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
-    allowed_exact_paths: frozenset,
+    allowed_exact_paths: frozenset, rng: random.Random,
 ) -> tuple[Optional[dict], Optional[str]]:
-    result = _control_fetch(client, url, scope, rate_limiter, retry_budget, config, allowed_exact_paths)
+    result = _control_fetch(client, url, scope, rate_limiter, retry_budget, config, allowed_exact_paths, rng)
     if not result.ok:
         return None, _control_failure_reason(result)
     try:

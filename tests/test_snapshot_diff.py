@@ -195,9 +195,10 @@ def test_diff_rejects_mismatched_allowed_prefixes(tmp_path: Path):
 def test_raw_response_artifacts_retained_per_fetch(tmp_path: Path):
     """Astra HOLD r2, group7: the generation JSON used to serialize only
     hashes/metadata, with no way to independently verify a fetch's raw
-    bytes. Every fetch attempt with an actual HTTP response must now
-    also retain a header subset and the raw body, addressable by hash,
-    under the generation's own `blobs/` directory."""
+    bytes. Every *page* fetch attempt with an actual HTTP response must
+    now also retain a header subset and the raw body, addressable by
+    hash, under the generation's own `blobs/` directory (control fetches
+    stay represented by their own metadata/hashes only)."""
     a = FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")
     state = FixtureState(products=[a])
     with FixtureServer(state) as server:

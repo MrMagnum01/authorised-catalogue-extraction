@@ -23,6 +23,7 @@ still stops the next retry from ever being sent.
 from __future__ import annotations
 
 import hashlib
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -72,6 +73,7 @@ def fetch_resource(
     require_prefix: bool = True,
     robots: Optional[RobotsResult] = None,
     allowed_exact_paths: Optional[frozenset] = None,
+    rng: Optional[random.Random] = None,
 ) -> FetchResult:
     """Fetch `url`, following redirects manually.
 
@@ -124,8 +126,8 @@ def fetch_resource(
                 attempts.append(FetchAttempt(global_attempt, current_url, None, "timeout", elapsed, waited_before))
                 if attempt_no >= max_attempts:
                     return FetchResult(False, current_url, None, None, attempts, "failed:timeout", redirect_chain)
-                backoff = backoff_delay(attempt_no)
-                if not retry_budget.can_afford(backoff):
+                backoff = backoff_delay(attempt_no, rng=rng)
+                if not retry_budget.can_afford(backoff, now=time.monotonic()):
                     return FetchResult(False, current_url, None, None, attempts, "failed:retry_budget_exceeded", redirect_chain)
                 time.sleep(backoff)
                 retry_budget.spend(backoff)
@@ -136,8 +138,8 @@ def fetch_resource(
                 attempts.append(FetchAttempt(global_attempt, current_url, None, f"transport_error:{exc}", elapsed, waited_before))
                 if attempt_no >= max_attempts:
                     return FetchResult(False, current_url, None, None, attempts, "failed:network_error", redirect_chain)
-                backoff = backoff_delay(attempt_no)
-                if not retry_budget.can_afford(backoff):
+                backoff = backoff_delay(attempt_no, rng=rng)
+                if not retry_budget.can_afford(backoff, now=time.monotonic()):
                     return FetchResult(False, current_url, None, None, attempts, "failed:retry_budget_exceeded", redirect_chain)
                 time.sleep(backoff)
                 retry_budget.spend(backoff)
@@ -159,10 +161,10 @@ def fetch_resource(
                 return FetchResult(False, current_url, status, None, attempts, "failed:not_found", redirect_chain)
             if status in RETRYABLE_STATUS:
                 retry_after = parse_retry_after(resp.headers.get("retry-after"))
-                wait_s = retry_after if retry_after is not None else backoff_delay(attempt_no)
+                wait_s = retry_after if retry_after is not None else backoff_delay(attempt_no, rng=rng)
                 if attempt_no >= max_attempts:
                     return FetchResult(False, current_url, status, None, attempts, "failed:retries_exhausted", redirect_chain)
-                if not retry_budget.can_afford(wait_s):
+                if not retry_budget.can_afford(wait_s, now=time.monotonic()):
                     return FetchResult(False, current_url, status, None, attempts, "failed:retry_budget_exceeded", redirect_chain)
                 time.sleep(wait_s)
                 retry_budget.spend(wait_s)

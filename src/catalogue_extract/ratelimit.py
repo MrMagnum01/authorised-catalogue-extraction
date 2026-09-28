@@ -64,8 +64,22 @@ class RetryBudget:
     def remaining(self) -> float:
         return self._remaining
 
-    def can_afford(self, seconds: float) -> bool:
-        return seconds <= self._remaining
+    def can_afford(self, seconds: float, now: Optional[float] = None) -> bool:
+        """Refuse a wait the caller-driven pool alone would still allow.
+
+        `seconds <= self._remaining` alone only reflects time already
+        spent sleeping; it says nothing about a slow-but-not-erroring
+        round trip that already burned most of the real deadline. When
+        `now` is given, also refuse if `elapsed(now) + seconds` would
+        reach or exceed the total budget — a 110s response plus a 100s
+        `Retry-After` under a 120s budget must never be allowed to sleep
+        to 210s just because no explicit wait had been charged yet.
+        """
+        if seconds > self._remaining:
+            return False
+        if now is not None and self.elapsed(now) + seconds >= self._total:
+            return False
+        return True
 
     def spend(self, seconds: float) -> None:
         self._remaining = max(0.0, self._remaining - seconds)

@@ -14,13 +14,17 @@ temp file; this is a single-writer design, not a claim of safe
 concurrent publication, and there is no claim of power-loss durability
 beyond whatever `os.replace` already guarantees on the host filesystem.
 
-Every fetch attempt with an actual HTTP response also gets a raw
-artifact: a status code and a small header subset in the JSON itself,
-plus the raw response body written under `generations/<crawl_id>/blobs/
-<sha256>.bin`, deduplicated by content hash. The JSON only ever
-references the body by its hash — never inlines it — so the generation
-file stays small and diffable while the underlying bytes stay
-independently auditable.
+Every *page* fetch attempt (listing/detail, not permission/robots/
+snapshot-meta) with an actual HTTP response also gets a raw artifact: a
+status code and a small header subset in the JSON itself, plus the raw
+response body written under `generations/<crawl_id>/blobs/<sha256>.bin`,
+deduplicated by content hash. The JSON only ever references the body by
+its hash — never inlines it — so the generation file stays small and
+diffable while the underlying bytes stay independently auditable.
+Control fetches are represented only by their own metadata/hashes
+(`permission_sha256`, `robots.sha256`, `start_snapshot`/`end_snapshot`)
+on the generation itself; their response bodies are never written as
+blobs.
 """
 from __future__ import annotations
 
