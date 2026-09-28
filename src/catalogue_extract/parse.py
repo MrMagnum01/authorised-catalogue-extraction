@@ -25,7 +25,13 @@ v2 detail:        <article class="item" id="item-ID">
                    </article>
 
 Anything matching neither signature is `template_unrecognised` — we
-never guess at fields from an unknown layout.
+never guess at fields from an unknown layout. A page carrying both a v1
+*and* a v2 detail container, or more than one container of the same
+version, or more than one match for a single required field within one
+container, is `ambiguous` — every field lookup is scoped to its single
+detail container, never to the whole page, so a second product's markup
+elsewhere on the page (or a second conflicting element inside the same
+container) can never silently supply this record's data.
 """
 from __future__ import annotations
 
@@ -81,6 +87,17 @@ def _content_hash(product_id: Optional[str], name: Optional[str], price: Optiona
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _scoped_field(container, selector: str) -> tuple[Optional[object], str]:
+    """Look up `selector` within `container` only. Returns (node_or_None, status)
+    where status is "ok" (exactly one match), "missing" (zero) or "ambiguous" (more than one)."""
+    nodes = container.css(selector)
+    if not nodes:
+        return None, "missing"
+    if len(nodes) > 1:
+        return None, "ambiguous"
+    return nodes[0], "ok"
+
+
 def _parse_price(text: Optional[str], currency: Optional[str]) -> tuple[Optional[Money], str]:
     if text is None or currency is None:
         return None, "unknown"
@@ -97,37 +114,50 @@ def _parse_price(text: Optional[str], currency: Optional[str]) -> tuple[Optional
         return None, "ambiguous"
 
 
+def _scoped_price(container, selector: str, currency_attr: str) -> tuple[Optional[Money], str]:
+    node, status = _scoped_field(container, selector)
+    if status == "ambiguous":
+        return None, "ambiguous"
+    if status == "missing":
+        return None, "unknown"
+    return _parse_price(node.text(strip=True), node.attributes.get(currency_attr))
+
+
 def parse_detail(html: bytes, url: str) -> RawProductRecord:
     tree = HTMLParser(html)
     content_hash_of_bytes = hashlib.sha256(html).hexdigest()
 
-    v1_node = tree.css_first("div.product-detail[data-product-id]")
-    if v1_node is not None:
-        product_id = v1_node.attributes.get("data-product-id")
-        name_node = tree.css_first("h1.prod-name")
-        price_node = tree.css_first("span.prod-price")
-        cat_node = tree.css_first("span.prod-category")
-        name = name_node.text(strip=True) if name_node else None
-        category = cat_node.text(strip=True) if cat_node else None
-        price, price_status = _parse_price(
-            price_node.text(strip=True) if price_node else None,
-            price_node.attributes.get("data-currency") if price_node else None,
-        )
-        return _finish_record(product_id, name, price, price_status, category, "v1", url, content_hash_of_bytes)
+    v1_nodes = tree.css("div.product-detail[data-product-id]")
+    v2_nodes = [n for n in tree.css("article.item[id]") if (n.attributes.get("id") or "").startswith("item-")]
 
-    v2_node = tree.css_first("article.item[id]")
-    if v2_node is not None and (v2_node.attributes.get("id") or "").startswith("item-"):
-        product_id = (v2_node.attributes.get("id") or "")[len("item-"):]
-        title_node = tree.css_first("h2.item-title")
-        price_node = tree.css_first("span.price-value")
-        cat_node = tree.css_first("td.item-category")
-        name = title_node.text(strip=True) if title_node else None
-        category = cat_node.text(strip=True) if cat_node else None
-        price, price_status = _parse_price(
-            price_node.text(strip=True) if price_node else None,
-            price_node.attributes.get("data-ccy") if price_node else None,
+    if v1_nodes and v2_nodes:
+        return _rejected("ambiguous_field:mixed_template", None, "ambiguous", url, content_hash_of_bytes)
+
+    if v1_nodes:
+        if len(v1_nodes) > 1:
+            return _rejected("ambiguous_field:container", None, "ambiguous", url, content_hash_of_bytes)
+        container = v1_nodes[0]
+        product_id = container.attributes.get("data-product-id")
+        name, name_status = _scoped_text(container, "h1.prod-name")
+        category, category_status = _scoped_text(container, "span.prod-category")
+        price, price_status = _scoped_price(container, "span.prod-price", "data-currency")
+        return _finish_record(
+            product_id, name, name_status, price, price_status, category, category_status,
+            "v1", url, content_hash_of_bytes,
         )
-        return _finish_record(product_id, name, price, price_status, category, "v2", url, content_hash_of_bytes)
+
+    if v2_nodes:
+        if len(v2_nodes) > 1:
+            return _rejected("ambiguous_field:container", None, "ambiguous", url, content_hash_of_bytes)
+        container = v2_nodes[0]
+        product_id = (container.attributes.get("id") or "")[len("item-"):]
+        name, name_status = _scoped_text(container, "h2.item-title")
+        category, category_status = _scoped_text(container, "td.item-category")
+        price, price_status = _scoped_price(container, "span.price-value", "data-ccy")
+        return _finish_record(
+            product_id, name, name_status, price, price_status, category, category_status,
+            "v2", url, content_hash_of_bytes,
+        )
 
     return RawProductRecord(
         product_id=None,
@@ -143,7 +173,36 @@ def parse_detail(html: bytes, url: str) -> RawProductRecord:
     )
 
 
-def _finish_record(product_id, name, price, price_status, category, template, url, raw_hash) -> RawProductRecord:
+def _scoped_text(container, selector: str) -> tuple[Optional[str], str]:
+    node, status = _scoped_field(container, selector)
+    if status != "ok":
+        return None, status
+    return node.text(strip=True), "ok"
+
+
+def _rejected(reason: str, product_id, template, url, raw_hash) -> RawProductRecord:
+    return RawProductRecord(
+        product_id=product_id, name=None, price=None, price_status="unknown",
+        category=None, template=template, source_url=url, content_hash=raw_hash,
+        outcome="rejected", reason=reason,
+    )
+
+
+def _finish_record(
+    product_id, name, name_status, price, price_status, category, category_status,
+    template, url, raw_hash,
+) -> RawProductRecord:
+    ambiguous = [
+        field_name for field_name, status in (
+            ("name", name_status), ("price", price_status), ("category", category_status),
+        ) if status == "ambiguous"
+    ]
+    if ambiguous:
+        return RawProductRecord(
+            product_id=product_id, name=name, price=price, price_status=price_status,
+            category=category, template=template, source_url=url, content_hash=raw_hash,
+            outcome="rejected", reason=f"ambiguous_field:{'+'.join(ambiguous)}",
+        )
     if not product_id or not name:
         return RawProductRecord(
             product_id=product_id, name=name, price=price, price_status=price_status,

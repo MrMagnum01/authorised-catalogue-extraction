@@ -1,13 +1,19 @@
 """CSV/XLSX export with the project's formula-injection mitigation.
 
-Mitigation: any exported text field starting with `=`, `+`, `-`, `@`,
-tab or carriage-return is prefixed with a leading single quote. This is
-the conventional Excel/Sheets "treat as text" marker on *import*; it is
-not a guarantee that every CSV consumer honours it, and plain CSV has
-no native escaping for spreadsheet formulas — hence "the chosen
-mitigation", not a universal-safety claim. The unmodified value is
-never lost: it stays in the JSON generation file untouched, only the
-CSV/XLSX display copy is transformed.
+Mitigation: every externally-supplied text field — `product_id`,
+`name`, `category` (parsed from the crawled HTML, never from this
+code's own constants) — starting with `=`, `+`, `-`, `@`, tab or
+carriage-return is prefixed with a leading single quote. This is the
+conventional Excel/Sheets "treat as text" marker on *import*; it is not
+a guarantee that every CSV consumer honours it, and plain CSV has no
+native escaping for spreadsheet formulas — hence "the chosen
+mitigation", not a universal-safety claim. In the XLSX export the same
+three columns additionally have their cell `data_type` forced to `"s"`
+(string), so even a consumer that ignores the leading-apostrophe
+convention still cannot have openpyxl or Excel treat the cell as a
+formula. The unmodified value is never lost: it stays in the JSON
+generation file untouched, only the CSV/XLSX display copy is
+transformed.
 """
 from __future__ import annotations
 
@@ -59,6 +65,9 @@ def products_with_provenance(generation: dict) -> list[dict]:
     return rows
 
 
+_TEXT_COLUMNS = ("product_id", "name", "category")
+
+
 def write_products_csv(generation: dict, path: Path) -> None:
     rows = products_with_provenance(generation)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -66,8 +75,8 @@ def write_products_csv(generation: dict, path: Path) -> None:
         writer.writeheader()
         for row in rows:
             safe_row = dict(row)
-            safe_row["name"] = sanitize_formula_field(row["name"])
-            safe_row["category"] = sanitize_formula_field(row["category"])
+            for col in _TEXT_COLUMNS:
+                safe_row[col] = sanitize_formula_field(row[col])
             writer.writerow(safe_row)
 
 
@@ -78,20 +87,29 @@ def write_products_xlsx(generation: dict, path: Path) -> None:
     ws.title = "products"
     ws.append(CSV_COLUMNS)
     for row in rows:
-        ws.append([
-            row["product_id"],
-            sanitize_formula_field(row["name"]),
-            row["amount_minor"],
-            row["currency"],
-            sanitize_formula_field(row["category"]),
-            row["template"],
-            row["source_url"],
-            row["final_url"],
-            row["fetch_utc"],
-            row["http_status"],
-            row["content_sha256"],
-            row["parser_version"],
-        ])
+        values = {
+            "product_id": sanitize_formula_field(row["product_id"]),
+            "name": sanitize_formula_field(row["name"]),
+            "amount_minor": row["amount_minor"],
+            "currency": row["currency"],
+            "category": sanitize_formula_field(row["category"]),
+            "template": row["template"],
+            "source_url": row["source_url"],
+            "final_url": row["final_url"],
+            "fetch_utc": row["fetch_utc"],
+            "http_status": row["http_status"],
+            "content_sha256": row["content_sha256"],
+            "parser_version": row["parser_version"],
+        }
+        ws.append([values[col] for col in CSV_COLUMNS])
+        # Any externally-supplied text field is forced literal-text, not
+        # just quote-prefixed, so a spreadsheet consumer that ignores the
+        # leading-apostrophe convention still cannot execute it as a formula.
+        excel_row = ws.max_row
+        for col in _TEXT_COLUMNS:
+            cell = ws.cell(row=excel_row, column=CSV_COLUMNS.index(col) + 1)
+            if cell.value is not None:
+                cell.data_type = "s"
     wb.save(path)
 
 

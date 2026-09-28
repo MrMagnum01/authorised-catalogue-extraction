@@ -77,3 +77,54 @@ def test_unrecognised_listing_flagged():
     html = b"<html><body><p>totally different site</p></body></html>"
     result = parse_listing(html, "http://x/catalogue/")
     assert result.template == "unrecognised"
+
+
+def test_two_conflicting_prices_in_one_container_rejected_as_ambiguous():
+    """Astra HOLD group 6: a second, conflicting price element inside the
+    same detail container must not be silently ignored in favour of the
+    first (`css_first`) match."""
+    html = (
+        b'<div class="product-detail" data-product-id="P1">'
+        b'<h1 class="prod-name">One</h1>'
+        b'<span class="prod-price" data-currency="USD">100</span>'
+        b'<span class="prod-price" data-currency="EUR">999</span>'
+        b'<span class="prod-category">A</span>'
+        b"</div>"
+    )
+    record = parse_detail(html, "http://x/catalogue/product/P1")
+    assert record.outcome == "rejected"
+    assert record.price is None
+    assert "price" in record.reason
+
+
+def test_two_detail_containers_on_one_page_rejected_as_ambiguous():
+    html = (
+        render_detail_v1(P).encode()[:-len("</body></html>")]
+        + render_detail_v1(FixtureProduct(id="SKU-0002", name="Widget B", amount_minor=500, currency="USD", category="Widgets")).encode()
+        + b"</body></html>"
+    )
+    record = parse_detail(html, "http://x/catalogue/product/SKU-0001")
+    assert record.outcome == "rejected"
+    assert "ambiguous_field:container" in record.reason
+
+
+def test_mixed_v1_and_v2_containers_on_one_page_rejected():
+    mixed = (
+        render_detail_v1(P).encode()[:-len("</body></html>")]
+        + render_detail_v2(P).encode()[len("<!DOCTYPE html><html><body>"):]
+    )
+    record = parse_detail(mixed, "http://x/catalogue/product/SKU-0001")
+    assert record.outcome == "rejected"
+    assert "mixed_template" in record.reason
+
+
+def test_fields_scoped_to_container_not_whole_page():
+    """A field selector must never reach outside its own detail container
+    for a value, even when a second, unrelated element with the same
+    class exists elsewhere on the page (e.g. a related-product teaser)."""
+    other_price = b'<span class="prod-price" data-currency="EUR">1</span>'
+    html = other_price + render_detail_v1(P).encode()
+    record = parse_detail(html, "http://x/catalogue/product/SKU-0001")
+    assert record.outcome == "accepted"
+    assert record.price.amount_minor == 1999
+    assert record.price.currency == "USD"

@@ -3,10 +3,21 @@
 Architecture note: product records come exclusively from detail pages;
 listing pages only ever yield discovery links (more listing pages, or
 detail links). Listing and detail records never overlap.
+
+Permission, robots and the snapshot-meta endpoint are all fetched
+through the same guarded `fetch_resource` path used for pages — exact
+origin validation, shared pacing, a response-size cap and a bounded,
+revalidated redirect chain — with `max_attempts=1` so a control
+endpoint's own 429/5xx/timeout still causes an immediate, specific
+refusal rather than retrying (robots/permission policy is "refuse the
+run", not "retry then refuse"), while still sharing the same
+`RateLimiter`/`RetryBudget` instances as page fetches for one
+consistent pacing/budget picture per run.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,11 +27,12 @@ import httpx
 
 from . import PARSER_VERSION
 from .boundary import Scope, canonical_url, is_in_scope
-from .fetch import fetch_resource
+from .fetch import FetchResult, fetch_resource
 from .models import PageOutcome, Product, RawProductRecord
 from .parse import parse_detail, parse_listing
+from .permission import PermissionGrant, parse_permission, validate_permission_scope
 from .ratelimit import RateLimiter, RetryBudget
-from .robots import RobotsResult, can_fetch, fetch_and_parse_robots
+from .robots import RobotsResult, can_fetch, parse_robots_response
 
 
 def _now_iso() -> str:
@@ -63,11 +75,16 @@ class CrawlResult:
     started_at: str
     ended_at: Optional[str]
     scope_origin: str
+    allowed_prefixes: tuple
+    seed_listing_url: str
     permission_sha256: Optional[str]
     permission_fetched_at: Optional[str]
-    robots: Optional[RobotsResult]
-    start_snapshot: Optional[dict]
-    end_snapshot: Optional[dict]
+    permission_site: Optional[str] = None
+    permission_allowed_paths: tuple = ()
+    permission_purpose: Optional[str] = None
+    robots: Optional[RobotsResult] = None
+    start_snapshot: Optional[dict] = None
+    end_snapshot: Optional[dict] = None
     pages: dict = field(default_factory=dict)
     out_of_scope_urls: set = field(default_factory=set)
     accounting: Accounting = field(default_factory=Accounting)
@@ -77,6 +94,63 @@ class CrawlResult:
     exact_duplicates: int = 0
     expected_items: Optional[int] = None
     listing_detail_overlap: bool = False
+
+
+def _control_fetch(
+    client: httpx.Client, url: str, scope: Scope,
+    rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
+) -> FetchResult:
+    """Guarded single-attempt fetch for permission/robots/snapshot-meta:
+    exact-origin boundary check, shared pacing, response-size cap and a
+    bounded, revalidated redirect chain — but no retry, since a control
+    endpoint's own transient error must refuse the run, not be retried
+    away."""
+    return fetch_resource(
+        client, url, scope, rate_limiter, retry_budget,
+        max_attempts=1, max_redirects=config.max_redirects,
+        max_response_bytes=config.max_response_bytes,
+        connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
+        user_agent=config.user_agent, require_prefix=False,
+    )
+
+
+def _control_failure_reason(result: FetchResult) -> str:
+    reason = result.terminal_reason or "unreachable"
+    if reason.startswith("boundary:"):
+        return reason
+    if reason == "failed:not_found":
+        return "status_404"
+    if reason == "failed:timeout":
+        return "timeout"
+    if reason == "failed:network_error":
+        return "unreachable"
+    if reason == "failed:response_too_large":
+        return "response_too_large"
+    if reason in ("failed:redirect_loop", "failed:too_many_redirects", "failed:redirect_no_location"):
+        return reason.split(":", 1)[1]
+    if reason == "failed:retries_exhausted" and result.status_code is not None:
+        return f"status_{result.status_code}"
+    return reason
+
+
+def _robots_from_control_fetch(result: FetchResult, fetched_at: str) -> RobotsResult:
+    if result.ok:
+        return parse_robots_response(result.status_code, result.content, fetched_at)
+    reason = result.terminal_reason or ""
+    if reason.startswith("boundary:"):
+        return RobotsResult(False, f"boundary_{result.boundary_reason}", None, fetched_at, None, None)
+    if reason == "failed:timeout":
+        return parse_robots_response(None, None, fetched_at, network_error="timeout")
+    if reason == "failed:network_error":
+        return parse_robots_response(None, None, fetched_at, network_error="unreachable")
+    if reason == "failed:not_found":
+        return parse_robots_response(404, None, fetched_at)
+    if reason == "failed:response_too_large":
+        return RobotsResult(False, "response_too_large", result.status_code, fetched_at, None, None)
+    if reason in ("failed:redirect_loop", "failed:too_many_redirects", "failed:redirect_no_location"):
+        return RobotsResult(False, reason.split(":", 1)[1], result.status_code, fetched_at, None, None)
+    # e.g. failed:retries_exhausted at max_attempts=1: classify by the status itself.
+    return parse_robots_response(result.status_code, None, fetched_at)
 
 
 def run_crawl(
@@ -91,58 +165,62 @@ def run_crawl(
     crawl_id = uuid.uuid4().hex[:12]
     started_at = _now_iso()
     accounting = Accounting()
-
-    for seed in (permission_url, robots_url, snapshot_meta_url, seed_listing_url):
-        if not seed.startswith(scope.origin):
-            return CrawlResult(
-                crawl_id=crawl_id, status="refused", reasons=["seed_url_outside_origin"],
-                started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
-                permission_sha256=None, permission_fetched_at=None, robots=None,
-                start_snapshot=None, end_snapshot=None, accounting=accounting,
-            )
-
-    accounting.control_requests += 1
-    try:
-        presp = client.get(permission_url, headers={"User-Agent": config.user_agent}, timeout=10.0)
-    except httpx.TransportError:
-        return CrawlResult(
-            crawl_id=crawl_id, status="refused", reasons=["permission_unreachable"],
-            started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
-            permission_sha256=None, permission_fetched_at=None, robots=None,
-            start_snapshot=None, end_snapshot=None, accounting=accounting,
-        )
-    if presp.status_code != 200:
-        return CrawlResult(
-            crawl_id=crawl_id, status="refused", reasons=[f"permission_status_{presp.status_code}"],
-            started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
-            permission_sha256=None, permission_fetched_at=None, robots=None,
-            start_snapshot=None, end_snapshot=None, accounting=accounting,
-        )
-    permission_sha256 = hashlib.sha256(presp.content).hexdigest()
-    permission_fetched_at = _now_iso()
-
-    accounting.control_requests += 1
-    robots = fetch_and_parse_robots(client, robots_url)
-    if not robots.ok:
-        return CrawlResult(
-            crawl_id=crawl_id, status="refused", reasons=[f"robots_{robots.reason}"],
-            started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
-            permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
-            robots=robots, start_snapshot=None, end_snapshot=None, accounting=accounting,
-        )
-
-    accounting.control_requests += 1
-    start_snapshot = _fetch_snapshot_meta(client, snapshot_meta_url, config.user_agent)
-    if start_snapshot is None:
-        return CrawlResult(
-            crawl_id=crawl_id, status="refused", reasons=["snapshot_meta_unreachable"],
-            started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
-            permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
-            robots=robots, start_snapshot=None, end_snapshot=None, accounting=accounting,
-        )
-
     rate_limiter = RateLimiter(config.min_interval_s, config.jitter_s)
     retry_budget = RetryBudget(config.retry_budget_s)
+
+    def refuse(reasons: list[str], **overrides) -> CrawlResult:
+        fields = dict(
+            crawl_id=crawl_id, status="refused", reasons=reasons,
+            started_at=started_at, ended_at=_now_iso(), scope_origin=scope.origin,
+            allowed_prefixes=scope.allowed_prefixes, seed_listing_url=seed_listing_url,
+            permission_sha256=None, permission_fetched_at=None, accounting=accounting,
+        )
+        fields.update(overrides)
+        return CrawlResult(**fields)
+
+    # --- Permission: a validated grant, not just a 200 status. ---
+    accounting.control_requests += 1
+    presp = _control_fetch(client, permission_url, scope, rate_limiter, retry_budget, config)
+    if not presp.ok:
+        return refuse([f"permission_{_control_failure_reason(presp)}"])
+    permission_sha256 = hashlib.sha256(presp.content).hexdigest()
+    permission_fetched_at = _now_iso()
+    try:
+        permission_text = presp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return refuse(["permission_malformed_encoding"],
+                       permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at)
+    grant: PermissionGrant = parse_permission(permission_text)
+    if not grant.ok:
+        return refuse([f"permission_{grant.reason}"],
+                       permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at)
+    scope_err = validate_permission_scope(grant, scope)
+    if scope_err:
+        return refuse([scope_err],
+                       permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
+                       permission_site=grant.site, permission_allowed_paths=grant.allowed_paths,
+                       permission_purpose=grant.purpose)
+
+    # --- Robots: a separate, stricter-than-RFC crawl-policy gate. ---
+    accounting.control_requests += 1
+    robots_fetched_at = _now_iso()
+    robots = _robots_from_control_fetch(
+        _control_fetch(client, robots_url, scope, rate_limiter, retry_budget, config), robots_fetched_at,
+    )
+    if not robots.ok:
+        return refuse([f"robots_{robots.reason}"],
+                       permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
+                       permission_site=grant.site, permission_allowed_paths=grant.allowed_paths,
+                       permission_purpose=grant.purpose, robots=robots)
+
+    # --- Snapshot metadata: typed, required, used for completeness reconciliation. ---
+    accounting.control_requests += 1
+    start_snapshot, start_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config)
+    if start_snapshot is None:
+        return refuse([f"snapshot_meta_{start_err}"],
+                       permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
+                       permission_site=grant.site, permission_allowed_paths=grant.allowed_paths,
+                       permission_purpose=grant.purpose, robots=robots)
 
     pages: dict[str, PageOutcome] = {}
     out_of_scope: set = set()
@@ -170,12 +248,13 @@ def run_crawl(
             max_attempts=config.max_attempts_per_url, max_redirects=config.max_redirects,
             max_response_bytes=config.max_response_bytes,
             connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
-            user_agent=config.user_agent,
+            user_agent=config.user_agent, robots=robots,
         )
 
         if not result.ok:
+            outcome_kind = "skipped_by_robots" if result.robots_denied else "failed"
             pages[canon] = PageOutcome(
-                url=url, canonical_url=canon, kind=kind, outcome="failed",
+                url=url, canonical_url=canon, kind=kind, outcome=outcome_kind,
                 attempts=result.attempts, final_url=result.final_url, status_code=result.status_code,
                 fetch_utc=_now_iso(), reason=result.terminal_reason,
             )
@@ -212,7 +291,12 @@ def run_crawl(
                 else:
                     out_of_scope.add(abs_next)
         else:
-            raw_products.append(parse_detail(result.content, result.final_url))
+            # `url` (the original, pre-redirect queue entry) is recorded as the
+            # record's source_url so it matches the canonical key `pages` is
+            # keyed by; the final (post-redirect) URL/status/hash are only ever
+            # available via that page entry, never by re-deriving a key from
+            # the final URL, which a redirect would otherwise silently break.
+            raw_products.append(parse_detail(result.content, url))
 
     accounting.parsed = sum(1 for p in pages.values() if p.outcome == "parsed")
     accounting.failed = sum(1 for p in pages.values() if p.outcome == "failed")
@@ -222,7 +306,7 @@ def run_crawl(
     accounting.discovered_in_scope = len(pages)
 
     accounting.control_requests += 1
-    end_snapshot = _fetch_snapshot_meta(client, snapshot_meta_url, config.user_agent)
+    end_snapshot, end_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config)
 
     products, rejected, conflicting, exact_dup_count = _resolve_products(raw_products)
 
@@ -240,32 +324,59 @@ def run_crawl(
     if accounting.skipped_by_robots:
         reasons.append("robots_denied_pages")
     if end_snapshot is None or start_snapshot != end_snapshot:
-        reasons.append("snapshot_changed_mid_crawl")
+        reasons.append("snapshot_changed_mid_crawl" if end_err is None else f"snapshot_meta_{end_err}")
+
+    listing_pages_parsed = sum(1 for p in pages.values() if p.kind == "listing" and p.outcome == "parsed")
+    advertised_pages = start_snapshot.get("advertised_pages")
+    advertised_items = start_snapshot.get("advertised_items")
+    if listing_pages_parsed != advertised_pages:
+        reasons.append("listing_page_count_mismatch")
+    if len(products) != advertised_items:
+        reasons.append("delivered_item_count_mismatch")
 
     status = "complete" if not reasons else "incomplete"
 
     return CrawlResult(
         crawl_id=crawl_id, status=status, reasons=sorted(set(reasons)), started_at=started_at,
-        ended_at=_now_iso(), scope_origin=scope.origin, permission_sha256=permission_sha256,
-        permission_fetched_at=permission_fetched_at, robots=robots,
+        ended_at=_now_iso(), scope_origin=scope.origin, allowed_prefixes=scope.allowed_prefixes,
+        seed_listing_url=seed_listing_url, permission_sha256=permission_sha256,
+        permission_fetched_at=permission_fetched_at, permission_site=grant.site,
+        permission_allowed_paths=grant.allowed_paths, permission_purpose=grant.purpose, robots=robots,
         start_snapshot=start_snapshot, end_snapshot=end_snapshot, pages=pages,
         out_of_scope_urls=out_of_scope, accounting=accounting, products=products,
         rejected=rejected, conflicting_ids=conflicting, exact_duplicates=exact_dup_count,
-        expected_items=(start_snapshot or {}).get("advertised_items"),
+        expected_items=advertised_items,
     )
 
 
-def _fetch_snapshot_meta(client: httpx.Client, url: str, user_agent: str) -> Optional[dict]:
+def _validate_snapshot_meta(meta: object) -> Optional[str]:
+    if not isinstance(meta, dict):
+        return "not_an_object"
+    snapshot_id = meta.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not snapshot_id:
+        return "missing_snapshot_id"
+    for key in ("advertised_pages", "advertised_items"):
+        val = meta.get(key)
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            return f"invalid_{key}"
+    return None
+
+
+def _fetch_snapshot_meta(
+    client: httpx.Client, url: str, scope: Scope,
+    rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
+) -> tuple[Optional[dict], Optional[str]]:
+    result = _control_fetch(client, url, scope, rate_limiter, retry_budget, config)
+    if not result.ok:
+        return None, _control_failure_reason(result)
     try:
-        resp = client.get(url, headers={"User-Agent": user_agent}, timeout=10.0)
-    except httpx.TransportError:
-        return None
-    if resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
+        meta = json.loads(result.content) if result.content else None
     except ValueError:
-        return None
+        return None, "invalid_json"
+    err = _validate_snapshot_meta(meta)
+    if err:
+        return None, err
+    return meta, None
 
 
 def _resolve_products(raw_products: list[RawProductRecord]):

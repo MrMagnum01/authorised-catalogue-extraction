@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from catalogue_extract.boundary import Scope
+from catalogue_extract.crawl import CrawlConfig, run_crawl
 from catalogue_extract.fetch import fetch_resource
 from catalogue_extract.ratelimit import RateLimiter, RetryBudget, backoff_delay, parse_retry_after
 from catalogue_fixture.data import generate_products
@@ -147,3 +148,87 @@ def test_response_too_large_rejected():
 def test_backoff_delay_grows_and_caps():
     assert backoff_delay(1, base=1.0, cap=10.0) < backoff_delay(3, base=1.0, cap=10.0) + 1.0
     assert backoff_delay(20, base=1.0, cap=10.0) <= 11.0
+
+
+def test_timeout_retry_spends_shared_budget_and_records_the_wait():
+    """Astra HOLD group 9: a timeout retry used to bypass the retry budget
+    entirely and its wait was never recorded on any attempt. Both must
+    now hold for timeouts exactly as they already did for 429/5xx."""
+    calls = {"n": 0}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("simulated", request=request)
+        return httpx.Response(200, content=b"ok")
+
+    scope = Scope.from_origin("http://127.0.0.1:1", ["/catalogue"])
+    budget = RetryBudget(120.0)
+    with httpx.Client(transport=httpx.MockTransport(transport), trust_env=False) as client:
+        result = fetch_resource(
+            client, "http://127.0.0.1:1/catalogue/", scope,
+            RateLimiter(0.0, 0.0), budget, max_attempts=3,
+        )
+    assert result.ok
+    assert calls["n"] == 2
+    assert budget.remaining < 120.0  # the backoff wait after the timeout was actually charged
+    assert result.attempts[1].waited_before_s > 0  # ...and recorded against the next attempt
+
+
+def test_timeout_retry_budget_exceeded_fails_fast_without_exhausting_attempts():
+    def transport(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    scope = Scope.from_origin("http://127.0.0.1:1", ["/catalogue"])
+    budget = RetryBudget(0.01)  # smaller than any real backoff_delay(1) (>= 1.0s)
+    with httpx.Client(transport=httpx.MockTransport(transport), trust_env=False) as client:
+        result = fetch_resource(
+            client, "http://127.0.0.1:1/catalogue/", scope,
+            RateLimiter(0.0, 0.0), budget, max_attempts=5,
+        )
+    assert not result.ok
+    assert result.terminal_reason == "failed:retry_budget_exceeded"
+    assert len(result.attempts) == 1
+
+
+def test_control_fetch_enforces_response_size_cap():
+    """Astra HOLD group 9: control requests (permission/robots/snapshot)
+    used to bypass the response-size cap entirely by calling `client.get`
+    directly instead of going through `fetch_resource`."""
+    origin = "http://127.0.0.1:1"
+    scope = Scope.from_origin(origin, ["/catalogue/"])
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/PERMISSION.md":
+            return httpx.Response(200, content=b"x" * 100)
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(transport), trust_env=False) as client:
+        result = run_crawl(
+            client, scope, origin + "/catalogue/", origin + "/PERMISSION.md",
+            origin + "/robots.txt", origin + "/_meta/snapshot",
+            CrawlConfig(min_interval_s=0, jitter_s=0, max_response_bytes=10),
+        )
+    assert result.status == "refused"
+    assert result.reasons == ["permission_response_too_large"]
+
+
+def test_control_fetch_guards_redirect_out_of_scope():
+    """A permission/robots/snapshot URL redirecting off-origin must be
+    refused, not followed — the same guarded-redirect rule as pages."""
+    origin = "http://127.0.0.1:1"
+    scope = Scope.from_origin(origin, ["/catalogue/"])
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/PERMISSION.md":
+            return httpx.Response(302, headers={"location": "http://192.0.2.1/evil"})
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(transport), trust_env=False) as client:
+        result = run_crawl(
+            client, scope, origin + "/catalogue/", origin + "/PERMISSION.md",
+            origin + "/robots.txt", origin + "/_meta/snapshot",
+            CrawlConfig(min_interval_s=0, jitter_s=0),
+        )
+    assert result.status == "refused"
+    assert any("host_mismatch" in r for r in result.reasons)

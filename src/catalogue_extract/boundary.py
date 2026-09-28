@@ -9,6 +9,7 @@ different port is out of scope exactly like a public third-party host.
 """
 from __future__ import annotations
 
+import ipaddress
 import posixpath
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
@@ -42,6 +43,12 @@ class Scope:
         port = parts.port or DEFAULT_PORTS.get(parts.scheme)
         if port is None:
             raise BoundaryError("malformed_origin", origin)
+        try:
+            is_loopback = ipaddress.ip_address(parts.hostname).is_loopback
+        except ValueError:
+            is_loopback = False
+        if not is_loopback:
+            raise BoundaryError("non_loopback_origin", origin)
         prefixes = tuple(p if p.startswith("/") else f"/{p}" for p in allowed_prefixes)
         if not prefixes:
             raise BoundaryError("no_allowed_prefixes", origin)
@@ -61,8 +68,18 @@ def _normalize_path(raw_path: str) -> str:
     return normalized
 
 
-def check_in_scope(url: str, scope: Scope) -> str:
-    """Return the normalized in-scope path, or raise BoundaryError."""
+def check_in_scope(url: str, scope: Scope, *, require_prefix: bool = True) -> str:
+    """Return the normalized in-scope path, or raise BoundaryError.
+
+    `require_prefix=False` validates the exact scheme/host/port (and
+    rejects credentials, malformed URLs and traversal) without requiring
+    the path to fall under `scope.allowed_prefixes`. Used for the fixed
+    control endpoints (PERMISSION.md, robots.txt, the snapshot-meta
+    endpoint), which are allowed to live outside the crawl's own allowed
+    paths but must still be the exact, single authorised origin — not a
+    same-prefix string match, which a port like `:12345` can spoof
+    against an allowed `:1234`.
+    """
     parts = urlsplit(url)
     if parts.username is not None or parts.password is not None:
         raise BoundaryError("credentials_in_url", url)
@@ -78,15 +95,17 @@ def check_in_scope(url: str, scope: Scope) -> str:
     normalized = _normalize_path(parts.path or "/")
     if normalized.startswith("/..") or normalized == "..":
         raise BoundaryError("path_traversal", url)
+    if not require_prefix:
+        return normalized
     if not any(normalized == p or normalized.startswith(p.rstrip("/") + "/") or normalized == p.rstrip("/")
                for p in scope.allowed_prefixes):
         raise BoundaryError("path_out_of_scope", url)
     return normalized
 
 
-def is_in_scope(url: str, scope: Scope) -> bool:
+def is_in_scope(url: str, scope: Scope, *, require_prefix: bool = True) -> bool:
     try:
-        check_in_scope(url, scope)
+        check_in_scope(url, scope, require_prefix=require_prefix)
         return True
     except BoundaryError:
         return False

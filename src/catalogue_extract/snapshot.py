@@ -6,7 +6,13 @@ crawl ever becomes the `current` pointer, via write-temp-then-rename
 (atomic on the same filesystem), so a reader never observes a half
 written pointer and a failed/incomplete crawl never displaces a good
 baseline. This module makes no promise about generations held open by
-readers across a GC pass, because it never runs one.
+readers across a GC pass, because it never runs one. `current.tmp` is a
+single fixed filename per `out_dir`: this module assumes one writer
+(one crawl process) at a time per output directory. Two concurrent
+`publish()` calls against the same `out_dir` can race on that shared
+temp file; this is a single-writer design, not a claim of safe
+concurrent publication, and there is no claim of power-loss durability
+beyond whatever `os.replace` already guarantees on the host filesystem.
 """
 from __future__ import annotations
 
@@ -34,8 +40,13 @@ def crawl_result_to_dict(result: CrawlResult) -> dict:
         "started_at": result.started_at,
         "ended_at": result.ended_at,
         "scope_origin": result.scope_origin,
+        "allowed_prefixes": list(result.allowed_prefixes),
+        "seed_listing_url": result.seed_listing_url,
         "permission_sha256": result.permission_sha256,
         "permission_fetched_at": result.permission_fetched_at,
+        "permission_site": result.permission_site,
+        "permission_allowed_paths": list(result.permission_allowed_paths),
+        "permission_purpose": result.permission_purpose,
         "robots": None if result.robots is None else {
             "ok": result.robots.ok,
             "reason": result.robots.reason,

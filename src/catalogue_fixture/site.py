@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
-from . import DEFAULT_PERMISSION_TEXT
+from . import DEFAULT_PERMISSION_TEMPLATE
 from .data import FixtureProduct
 from .templates import (
     render_detail_v1,
@@ -37,7 +37,8 @@ class FixtureState:
     template_version: str = "v1"
     robots_mode: str = "normal"
     robots_disallow: tuple = ("/catalogue/product/blocked",)
-    permission_text: str = DEFAULT_PERMISSION_TEXT
+    permission_mode: str = "granted"  # "granted" | "denied" | "wrong_site" | "narrow_paths" | "malformed"
+    permission_text_override: Optional[str] = None
     permission_missing: bool = False
     snapshot_id: str = "snap-0001"
     catalogue_version: int = 1
@@ -46,6 +47,8 @@ class FixtureState:
     other_origin: str = "http://127.0.0.1:1"
     special_products: dict = field(default_factory=dict)  # id -> raw html str
     extra_listing_links: list = field(default_factory=list)  # extra hrefs to surface from the listing page
+    redirect_map: dict = field(default_factory=dict)  # request path -> 302 Location
+    advertised_items_override: Optional[int] = None  # override len(products) in /_meta/snapshot
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -82,6 +85,19 @@ class FixtureState:
             lines.append(f"Disallow: {p}")
         lines.append("Allow: /catalogue/")
         return "\n".join(lines) + "\n"
+
+    def permission_body(self, origin: str) -> str:
+        if self.permission_text_override is not None:
+            return self.permission_text_override
+        if self.permission_mode == "denied":
+            return f"Site: {origin}\nAllowed-Paths: /catalogue/\nPurpose: demo\nPermission: denied\n"
+        if self.permission_mode == "wrong_site":
+            return "Site: http://127.0.0.1:1\nAllowed-Paths: /catalogue/\nPurpose: demo\nPermission: granted\n"
+        if self.permission_mode == "narrow_paths":
+            return f"Site: {origin}\nAllowed-Paths: /catalogue/only-a-subpath/\nPurpose: demo\nPermission: granted\n"
+        if self.permission_mode == "malformed":
+            return "Explicitly forbidden to crawl"
+        return DEFAULT_PERMISSION_TEMPLATE.format(origin=origin)
 
 
 def _make_handler(state: FixtureState):
@@ -121,18 +137,25 @@ def _make_handler(state: FixtureState):
                 self._send_bytes(inj.status, b"", extra_headers=headers)
                 return
 
+            if path in state.redirect_map:
+                return self._send_redirect(302, state.redirect_map[path])
+
             if path == "/robots.txt":
                 return self._handle_robots()
             if path == "/PERMISSION.md":
                 if state.permission_missing:
                     return self._send_text(404, "not found")
-                return self._send_text(200, state.permission_text)
+                origin = f"http://{self.headers.get('Host', '127.0.0.1')}"
+                return self._send_text(200, state.permission_body(origin))
             if path == "/_meta/snapshot":
+                items = state.advertised_items_override
+                if items is None:
+                    items = len(state.products)
                 return self._send_json(200, {
                     "snapshot_id": state.snapshot_id,
                     "catalogue_version": state.catalogue_version,
                     "advertised_pages": state.advertised_pages(),
-                    "advertised_items": len(state.products),
+                    "advertised_items": items,
                 })
             if path in ("/catalogue", "/catalogue/"):
                 state.note_page_request()

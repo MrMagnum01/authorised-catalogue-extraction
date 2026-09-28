@@ -84,7 +84,7 @@ def test_out_of_scope_bait_links_never_fetched():
     with FixtureServer(state) as other_server:
         state.other_origin = other_server.origin
         with FixtureServer(state) as server:
-            scope = Scope.from_origin(server.origin, ["/catalogue", "/_redirect"])
+            scope = Scope.from_origin(server.origin, ["/catalogue"])
             result = _run(server, scope)
     assert result.status in ("complete", "incomplete")
     assert result.accounting.out_of_scope_links >= 3  # external absolute, protocol-relative, other loopback
@@ -142,6 +142,7 @@ def test_exact_duplicate_merges_with_both_sources():
         products=[],
         special_products={"twin-1": twin_html, "twin-2": twin_html},
         extra_listing_links=["/catalogue/product/twin-1", "/catalogue/product/twin-2"],
+        advertised_items_override=1,  # the two mirrored URLs are one SKU once merged
     )
     with FixtureServer(state) as server:
         scope = Scope.from_origin(server.origin, ["/catalogue"])
@@ -150,3 +151,38 @@ def test_exact_duplicate_merges_with_both_sources():
     assert len(result.products) == 1
     assert result.exact_duplicates == 1
     assert len(result.products[0].source_urls) == 2
+
+
+def test_robots_rechecked_on_redirect_destination():
+    """Astra HOLD group 3: robots must be re-checked against a redirect's
+    *destination*, not just the URL that was originally queued. An
+    in-scope link that 302s into a robots-disallowed path must be
+    skipped, never fetched."""
+    state = FixtureState(
+        products=generate_products(n=1),
+        robots_disallow=("/catalogue/secret",),
+        redirect_map={"/catalogue/product/via-redirect": "/catalogue/secret"},
+        extra_listing_links=["/catalogue/product/via-redirect"],
+    )
+    with FixtureServer(state) as server:
+        scope = Scope.from_origin(server.origin, ["/catalogue"])
+        result = _run(server, scope)
+    assert result.status == "incomplete"
+    assert "robots_denied_pages" in result.reasons
+    assert result.accounting.skipped_by_robots == 1
+    # The single real product (reached directly, no redirect) still comes through.
+    assert len(result.products) == 1
+
+
+def test_advertised_item_count_overstated_marks_incomplete():
+    """Astra HOLD group 4: the fixture's advertised item count is a claim
+    to be reconciled, not just printed — a catalogue that advertises more
+    items than it actually delivers must not report `complete`."""
+    state = FixtureState(products=generate_products(n=1), advertised_items_override=99)
+    with FixtureServer(state) as server:
+        scope = Scope.from_origin(server.origin, ["/catalogue"])
+        result = _run(server, scope)
+    assert result.status == "incomplete"
+    assert "delivered_item_count_mismatch" in result.reasons
+    assert result.expected_items == 99
+    assert len(result.products) == 1

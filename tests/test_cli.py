@@ -45,3 +45,25 @@ def test_cli_crawl_export_and_diff_roundtrip(tmp_path: Path):
     assert rc4 == 0
     assert csv_path.exists()
     assert "product_id" in csv_path.read_text().splitlines()[0]
+
+
+def test_cli_diff_returns_nonzero_for_indeterminate_result(tmp_path: Path):
+    """Astra HOLD group 5: automation must be able to tell an INDETERMINATE
+    diff apart from a real one by exit code alone, not just by re-parsing
+    the JSON it printed."""
+    state = FixtureState(products=generate_products(n=2), robots_mode="error500")
+    with FixtureServer(state) as server:
+        out_dir = tmp_path / "run"
+        rc = main(["crawl", "--origin", server.origin, "--allow", "/catalogue", "--out", str(out_dir)])
+        assert rc == 2  # refused
+
+    refused_id = None
+    for p in (out_dir / "generations").iterdir():
+        refused_id = p.name
+    assert refused_id is not None
+
+    diff_path = tmp_path / "diff.json"
+    rc2 = main(["diff", "--dir", str(out_dir), "--new", refused_id, "--write-to", str(diff_path)])
+    assert rc2 != 0
+    diff = json.loads(diff_path.read_text())
+    assert diff["status"] == "INDETERMINATE"

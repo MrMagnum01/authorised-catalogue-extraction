@@ -46,7 +46,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.write_to:
         Path(args.write_to).write_text(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    return 0 if result["status"] in ("complete", "baseline_established") else 3
 
 
 def cmd_export(args: argparse.Namespace) -> int:

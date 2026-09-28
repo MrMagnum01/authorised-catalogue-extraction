@@ -42,25 +42,33 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def fetch_and_parse_robots(client: httpx.Client, robots_url: str) -> RobotsResult:
-    fetched_at = _now_iso()
-    try:
-        resp = client.get(robots_url, timeout=10.0)
-    except httpx.TimeoutException:
+def parse_robots_response(
+    status_code: Optional[int],
+    body: Optional[bytes],
+    fetched_at: str,
+    network_error: Optional[str] = None,
+) -> RobotsResult:
+    """Pure classification of an already-fetched robots.txt response.
+
+    Separated from the actual network call so the guarded, paced,
+    size-capped fetch path in `crawl.py` (which goes through
+    `fetch.fetch_resource`) and the simple standalone fetcher below can
+    share one policy implementation.
+    """
+    if network_error == "timeout":
         return RobotsResult(False, "timeout", None, fetched_at, None, None)
-    except httpx.TransportError:
+    if network_error is not None:
         return RobotsResult(False, "unreachable", None, fetched_at, None, None)
-
-    if resp.status_code == 404:
+    if status_code == 404:
         return RobotsResult(False, "missing", 404, fetched_at, None, None)
-    if resp.status_code == 429:
+    if status_code == 429:
         return RobotsResult(False, "rate_limited", 429, fetched_at, None, None)
-    if 500 <= resp.status_code < 600:
-        return RobotsResult(False, "server_error", resp.status_code, fetched_at, None, None)
-    if resp.status_code != 200:
-        return RobotsResult(False, f"unexpected_status_{resp.status_code}", resp.status_code, fetched_at, None, None)
+    if status_code is not None and 500 <= status_code < 600:
+        return RobotsResult(False, "server_error", status_code, fetched_at, None, None)
+    if status_code != 200:
+        return RobotsResult(False, f"unexpected_status_{status_code}", status_code, fetched_at, None, None)
 
-    body = resp.content
+    body = body or b""
     if b"\x00" in body:
         return RobotsResult(False, "malformed_bytes", 200, fetched_at, hashlib.sha256(body).hexdigest(), len(body))
     try:
@@ -78,6 +86,22 @@ def fetch_and_parse_robots(client: httpx.Client, robots_url: str) -> RobotsResul
         byte_count=len(body),
         parser=parser,
     )
+
+
+def fetch_and_parse_robots(client: httpx.Client, robots_url: str) -> RobotsResult:
+    """Simple, unguarded standalone fetch — used directly by tests that
+    exercise robots-policy classification in isolation. `run_crawl` uses
+    the guarded, paced, boundary- and size-checked path in `crawl.py`
+    instead, which also calls `parse_robots_response`.
+    """
+    fetched_at = _now_iso()
+    try:
+        resp = client.get(robots_url, timeout=10.0)
+    except httpx.TimeoutException:
+        return parse_robots_response(None, None, fetched_at, network_error="timeout")
+    except httpx.TransportError:
+        return parse_robots_response(None, None, fetched_at, network_error="unreachable")
+    return parse_robots_response(resp.status_code, resp.content, fetched_at)
 
 
 def can_fetch(result: RobotsResult, url: str, user_agent: str) -> bool:

@@ -114,6 +114,84 @@ def test_mid_crawl_snapshot_change_is_indeterminate_and_keeps_baseline(tmp_path:
     assert result["baseline_crawl_id"] == baseline_id
 
 
+def test_no_baseline_but_refused_new_is_indeterminate_not_baseline():
+    """Astra HOLD group 5: `compute_diff` must check the *new* generation's
+    completeness before ever returning `baseline_established`, even when
+    there is no prior generation at all."""
+    result = compute_diff(None, {"status": "refused"})
+    assert result["status"] == "INDETERMINATE"
+    assert any("new_generation_status_refused" in d for d in result["diagnostics"])
+
+
+def test_no_baseline_and_complete_new_establishes_baseline():
+    result = compute_diff(None, {"status": "complete", "crawl_id": "abc", "products": []})
+    assert result["status"] == "baseline_established"
+
+
+def test_diff_rejects_removals_from_a_narrower_authorised_subset(tmp_path: Path):
+    """Astra HOLD group 5: two complete crawls of the same scope_origin
+    but different authorised path/seed/permission bindings must not be
+    diffed as if they covered the same catalogue subset — a narrower
+    second run must not manufacture "removed" products."""
+    a = FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")
+    b = FixtureProduct("SKU-B", "Beta", 2000, "USD", "Widgets")
+    state = FixtureState(products=[a, b])
+    with FixtureServer(state) as server:
+        wide_scope = Scope.from_origin(server.origin, ["/catalogue"])
+        gen1 = _crawl(server, wide_scope)
+        publish(tmp_path, gen1)
+        assert gen1.status == "complete"
+
+        # A second, real crawl of the identical scope/seed/permission is a
+        # legitimate comparison (sanity: same bindings still diff cleanly).
+        gen_same = _crawl(server, wide_scope)
+        publish(tmp_path, gen_same)
+
+    old = load_generation(tmp_path, gen1.crawl_id)
+    same = load_generation(tmp_path, gen_same.crawl_id)
+    assert compute_diff(old, same)["status"] == "complete"
+
+    # Now simulate a generation that was bound to a different seed URL —
+    # e.g. a differently-parameterised crawl of the same origin — by
+    # mutating the loaded dict directly (this is the exact shape a
+    # narrower/parallel authorised subset would produce).
+    narrower = dict(same)
+    narrower["seed_listing_url"] = same["seed_listing_url"] + "?page=2"
+    result = compute_diff(old, narrower)
+    assert result["status"] == "INDETERMINATE"
+    assert "seed_url_mismatch" in result["diagnostics"]
+
+
+def test_diff_rejects_mismatched_permission_identity(tmp_path: Path):
+    a = FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")
+    state = FixtureState(products=[a])
+    with FixtureServer(state) as server:
+        scope = Scope.from_origin(server.origin, ["/catalogue"])
+        gen1 = _crawl(server, scope)
+        publish(tmp_path, gen1)
+    old = load_generation(tmp_path, gen1.crawl_id)
+    mutated = dict(old)
+    mutated["permission_sha256"] = "deadbeef" * 8
+    result = compute_diff(old, mutated)
+    assert result["status"] == "INDETERMINATE"
+    assert "permission_identity_mismatch" in result["diagnostics"]
+
+
+def test_diff_rejects_mismatched_allowed_prefixes(tmp_path: Path):
+    a = FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")
+    state = FixtureState(products=[a])
+    with FixtureServer(state) as server:
+        scope = Scope.from_origin(server.origin, ["/catalogue"])
+        gen1 = _crawl(server, scope)
+        publish(tmp_path, gen1)
+    old = load_generation(tmp_path, gen1.crawl_id)
+    mutated = dict(old)
+    mutated["allowed_prefixes"] = ["/catalogue", "/extra"]
+    result = compute_diff(old, mutated)
+    assert result["status"] == "INDETERMINATE"
+    assert "allowed_paths_mismatch" in result["diagnostics"]
+
+
 def test_failed_crawl_then_successful_retry_only_second_becomes_current(tmp_path: Path):
     state = FixtureState(products=[FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")], robots_mode="error500")
     with FixtureServer(state) as server:

@@ -62,10 +62,11 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-60+ tests, all run in-process against private `FixtureServer`
-instances on ephemeral loopback ports — no shared state between tests,
-nothing left running afterwards. Runtime is ~35s, dominated by tests
-that deliberately exercise real backoff/retry timing.
+89 tests, all run in-process against private `FixtureServer` instances
+on ephemeral loopback ports (or an in-process `httpx.MockTransport` for
+a few boundary-only cases) — no shared state between tests, nothing
+left running afterwards. Runtime is ~70s, dominated by tests that
+deliberately exercise real backoff/retry timing.
 
 ## Architecture
 
@@ -87,12 +88,27 @@ Listing and detail records never overlap.
 ## Permission and robots
 
 These are deliberately two separate gates, checked in this order, with
-the stricter outcome on failure:
+the stricter outcome on failure. Both are fetched through the same
+guarded path pages use (`fetch_resource`, see Scope enforcement below)
+with `max_attempts=1` — a control endpoint's own error refuses the run
+immediately rather than being retried — but still sharing pacing and
+the retry-time budget with page fetches, and still capped at
+`max_response_bytes` and a bounded, re-validated redirect chain.
 
-1. **Permission.** The scraper fetches `<origin>/PERMISSION.md` before
-   anything else. It must return `200`; its bytes are SHA-256-hashed
-   and the hash + fetch time go into the run manifest. Unreachable or
-   non-200 → the run is `refused`, nothing else is fetched.
+1. **Permission.** The scraper fetches `<origin>/PERMISSION.md` and
+   validates its body against an exact grammar
+   (`catalogue_extract/permission.py`): required `Site:`,
+   `Allowed-Paths:`, `Purpose:` and `Permission:` fields, one per line.
+   `Site` must equal the crawl's exact origin, `Permission` must be
+   exactly `granted`, and the CLI's own `--allow` prefixes must all fall
+   under the grant's `Allowed-Paths` — the command line can narrow what
+   a run touches, never widen it past what the file actually grants.
+   A `200` status is **not** itself authorisation: unreachable,
+   non-200, oversized, a body that fails the grammar, an explicit
+   `Permission: denied`, a `Site` mismatch, or CLI paths wider than the
+   grant, all refuse the run before anything else is fetched. The raw
+   bytes are still SHA-256-hashed and the hash, fetch time, and the
+   parsed `site`/`allowed_paths`/`purpose` all go into the run manifest.
 2. **Robots.** Parsed with [Protego](https://github.com/scrapy/protego)
    0.7.0 (pinned), which implements the tolerant, group-merging
    semantics of [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309.html)
@@ -107,8 +123,11 @@ the stricter outcome on failure:
    recorded the same way as PERMISSION.md.
 
 Only after both pass does the crawl attempt any listing or detail
-page, and `can_fetch()` is still checked per-URL against the parsed
-robots rules throughout.
+page, and `can_fetch()` is checked per-URL against the parsed robots
+rules throughout — including **every redirect hop**, not just the
+originally-queued URL: a page that 302s into a robots-disallowed path
+is refused mid-redirect, never fetched (`tests/test_crawl_accounting.py
+::test_robots_rechecked_on_redirect_destination`).
 
 ## Scope enforcement
 
@@ -117,8 +136,21 @@ redirect `Location` — is checked against a `Scope` (exact scheme, host,
 port, plus an allow-list of path prefixes) **before** any request is
 made:
 
+- `Scope.from_origin` itself only accepts a loopback address
+  (`ipaddress.ip_address(host).is_loopback`) — this demo enforces its
+  own local fixture origin and cannot be pointed at an arbitrary
+  public host even by CLI mistake.
 - Credentials in the URL, a different scheme, host or port, or a path
   outside the allow-list are all refused pre-request.
+- The fixed control endpoints (PERMISSION.md, robots.txt, the
+  snapshot-meta endpoint) are exempt from the path allow-list — they
+  live outside `/catalogue/` by design — but are still checked for the
+  *exact* scheme/host/port with the same `check_in_scope` used for
+  pages (`require_prefix=False`). A control URL is never matched by
+  `str.startswith(origin)`: that would let a URL on port `12345` pass
+  against an allowed origin on port `1234` (see
+  `tests/test_permission.py::test_control_url_port_prefix_spoof_is_refused_not_a_match`,
+  reproducing the exact case Astra's review flagged).
 - A second service on `127.0.0.1` on a different port is **not**
   treated as authorised just because it's loopback — it's out of scope
   exactly like a public third-party host (see
@@ -154,13 +186,25 @@ origin, and a redirect loop.
   small, so this limitation doesn't affect its own correctness, but
   it is a real gap against a hostile server), a page-count cap, a
   redirect-hop cap (5), and a **maximum of 5 attempts per URL**.
-- A shared **120-second retry-time budget** for the whole crawl.
-  `Retry-After` is parsed as either delta-seconds or an HTTP-date
-  (RFC 9110 §10.2.3). If the parsed wait would exceed the *remaining*
-  budget, the fetch fails immediately with `retry_budget_exceeded`
-  rather than sleeping a truncated amount and retrying early.
+- A shared **120-second retry-time budget** for the whole crawl,
+  charged uniformly across every retryable error class — a 429/5xx
+  status, a connection timeout, and a transport-level network error all
+  spend the same budget before they sleep and retry, and all fail
+  immediately with `retry_budget_exceeded` if the wait would exceed
+  what remains, rather than sleeping a truncated amount and retrying
+  early. `Retry-After` is parsed as either delta-seconds or an
+  HTTP-date (RFC 9110 §10.2.3).
 - Every attempt (status/error, elapsed time, wait-before) is recorded
-  against its page, not just the final outcome.
+  against its page, not just the final outcome — `waited_before_s`
+  includes both the rate-limiter's pacing wait and any backoff/
+  `Retry-After` wait carried over from the previous failed attempt, so
+  every second spent waiting is attributed to some recorded attempt.
+- Permission/robots/snapshot-meta control requests share the same
+  `RateLimiter` and `RetryBudget` instances as page fetches (one
+  consistent pacing/budget picture per run) and the same response-size
+  cap and guarded-redirect handling, but with `max_attempts=1` — a
+  control endpoint's own transient error refuses the run rather than
+  being retried.
 - User-Agent identifies the scraper:
   `catalogue-extract-demo/1.0 (+authorised fixture crawl; contact: demo-bot)`.
 
@@ -183,50 +227,93 @@ At the product level, `parsed` pages may yield zero or many records:
 `accepted`, `exact_duplicate` (same ID, identical data, multiple
 source URLs — merged), `conflicting_id` (same ID, different data —
 rejected, fails completeness), and `rejected` (missing required field,
-unknown/ambiguous price, or `template_unrecognised`). A crawl is
-`complete` only when **none** of failed / unattempted / robots-skipped
-/ conflicting / rejected pages occurred **and** the fixture's
-snapshot ID/version was stable from before the first request to after
-the last (see below) — otherwise it's `incomplete`, with the specific
-reasons listed. This is a deliberately strict definition: a single
-unsupported-template page or a single 404 marks the whole crawl
-incomplete, rather than trying to guess how much of it can still be
-trusted.
+unknown/ambiguous price, an **ambiguous field** — two conflicting
+matches for one required selector inside a single detail container, or
+two detail containers, or a mixed v1/v2 page, are all rejected rather
+than one being silently picked — or `template_unrecognised`). Every
+field lookup is scoped to its own detail container node, never to the
+whole page, so a second, unrelated product's markup elsewhere on the
+page can never supply this record's data (`tests/test_parse_templates.py`).
+
+The snapshot-meta endpoint's `advertised_pages` and `advertised_items`
+are typed, required and **reconciled**, not just printed: the number of
+listing pages actually parsed must equal `advertised_pages`, and the
+number of unique delivered products (after duplicate-merging) must
+equal `advertised_items`, or the crawl is `incomplete` with
+`listing_page_count_mismatch` / `delivered_item_count_mismatch`. A
+malformed or missing snapshot field (non-string ID, negative or
+non-integer count) refuses/invalidates the same way an unreachable
+snapshot endpoint does. A crawl is `complete` only when **none** of
+failed / unattempted / robots-skipped / conflicting / rejected pages
+occurred, the counts reconcile, **and** the fixture's snapshot
+ID/version was stable from before the first request to after the last
+(see below) — otherwise it's `incomplete`, with the specific reasons
+listed. This is a deliberately strict definition: a single
+unsupported-template page, a single 404, or a catalogue that only
+partially came through (1 of 99 advertised items) all mark the whole
+crawl incomplete, rather than trying to guess how much of it can still
+be trusted.
 
 ## Change monitoring
 
 `added` / `removed` / `price_changed` / `unchanged` is only ever
-computed between **two complete generations**. Anything less (a
-`refused` or `incomplete` crawl on either side, or no prior generation
-at all) returns `INDETERMINATE` with diagnostics — a detail-page 404
-by itself never becomes a "removed" claim, and a failed crawl never
-overwrites the `current` pointer, so the next diff still compares
-against the last good baseline. Products are matched by stable ID, not
-URL or listing order. A currency change on the same ID is reported
-separately as `currency_changed_anomaly` and is never folded into
-`price_changed` (amounts in different currencies are never compared or
-summed as if interchangeable). Price is always an integer minor-unit
-amount plus an explicit currency; a missing or ambiguous price is
-`unknown`/`ambiguous`, never `0`.
+computed between **two complete generations of the same authorised
+scope**. The *new* generation's completeness is checked first, even
+when there is no prior generation at all — a `refused` first crawl
+never becomes `baseline_established`, only a `complete` one does.
+Beyond both sides being `complete`, the two generations must also share
+the same `scope_origin`, `allowed_prefixes`, `seed_listing_url` and
+`permission_sha256` — two crawls of the same origin but a different
+authorised path set, seed, or permission grant are never diffed as if
+they covered the same catalogue subset (`tests/test_snapshot_diff.py`).
+Anything short of this returns `INDETERMINATE` with diagnostics — a
+detail-page 404 by itself never becomes a "removed" claim, and a failed
+crawl never overwrites the `current` pointer, so the next diff still
+compares against the last good baseline. The CLI's `diff` subcommand
+exits non-zero for anything other than `complete` or
+`baseline_established`, so automation can branch on the exit code
+without re-parsing the JSON.
+
+Products are matched by stable ID, not URL or listing order.
+`unchanged` narrows specifically to **price and currency** being
+identical between the two snapshots — name/category drift on the same
+ID is not currently compared or reported. A currency change on the
+same ID is reported separately as `currency_changed_anomaly` and is
+never folded into `price_changed` (amounts in different currencies are
+never compared or summed as if interchangeable). Price is always an
+integer minor-unit amount plus an explicit currency; a missing or
+ambiguous price is `unknown`/`ambiguous`, never `0`.
 
 Generations are stored under `<out>/generations/<crawl_id>/` and are
 **never deleted** by this code. `<out>/current` is a plain text pointer
 updated via write-temp-then-`os.replace` (atomic on the same
 filesystem) and only ever advanced by a `complete` crawl — this repo
 makes no broader guarantee about generations still open by a reader
-during a hypothetical future GC pass, because it never runs one.
+during a hypothetical future GC pass, because it never runs one. This
+is also a **single-writer** design: `current.tmp` is one fixed filename
+per output directory, so two `publish()` calls racing against the same
+`--out` directory from separate processes can clobber each other's temp
+file — there is no claim of safe concurrent publication from multiple
+writers, and no claim of power-loss durability beyond whatever
+`os.replace` already guarantees on the host filesystem.
 
 ## Export safety
 
-CSV and XLSX rows sanitize any text field starting with `=`, `+`, `-`,
-`@`, tab, or carriage-return by prefixing a leading single quote — the
-conventional Excel/Sheets "force text" marker on import. **This is not
-a universal CSV-injection guarantee**: plain CSV has no native
-escaping for spreadsheet formulas, and not every consumer honours the
-leading-quote convention (see `tests/test_export.py`, which crawls a
-fixture product deliberately named `=cmd|'/c calc'!A1` and checks both
-the export mitigation and that the unmodified name is still present,
-untouched, in the underlying JSON generation).
+CSV and XLSX rows sanitize every externally-supplied text field —
+`product_id`, `name`, and `category` (all parsed from crawled HTML) —
+starting with `=`, `+`, `-`, `@`, tab, or carriage-return by prefixing a
+leading single quote — the conventional Excel/Sheets "force text"
+marker on import. In the XLSX export those same three columns
+additionally have their cell `data_type` forced to `"s"` (string), so a
+value like a product ID of `=1+1` cannot end up as a live formula cell
+even for a consumer that ignores the leading-apostrophe convention.
+**This is not a universal CSV-injection guarantee**: plain CSV has no
+native escaping for spreadsheet formulas, and not every consumer
+honours the leading-quote convention (see `tests/test_export.py`, which
+crawls fixture products deliberately named `=cmd|'/c calc'!A1` and with
+product ID `=1+1`, and checks both the export mitigation and that the
+unmodified values are still present, untouched, in the underlying JSON
+generation).
 
 ## Known limitations (narrowing the claims to what's tested)
 
@@ -245,6 +332,12 @@ untouched, in the underlying JSON generation).
   there's no claim of broader template coverage.
 - Completeness is intentionally strict (see Accounting) — this
   favours refusing to publish a change claim over guessing.
+- `PERMISSION.md`'s grammar (`catalogue_extract/permission.py`) is this
+  demo's own, invented for this repository — not a claim about any
+  real-world permission-file standard.
+- This demo only ever runs against a loopback origin
+  (`Scope.from_origin` requires it) — it has no code path that would
+  accept a public host even if one were passed on the command line.
 
 ## Repository layout
 
