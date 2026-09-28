@@ -1,7 +1,6 @@
 # authorised-catalogue-extraction
 
-**Synthetic portfolio demonstration, implemented with AI coding agents.
- No client data or client work.**
+**Synthetic portfolio demonstration, implemented with AI coding agents. No client data or client work.**
 
 **Independent review:** cleared by the company’s separate AI reviewer at commit a1d4a6c (scope: bounded local demo; owned synthetic catalogue, explicit scope/permission and separate robots checks). Later commits are not covered by that review.
 
