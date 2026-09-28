@@ -100,6 +100,35 @@ def test_parse_permission_denied_value_rejected():
     assert grant.reason == "not_granted"
 
 
+def test_parse_permission_rejects_conflicting_duplicate_permission_granted_then_denied():
+    """Astra HOLD r2, group2: a required key repeated used to silently
+    keep the first occurrence — a valid grant followed by `Permission:
+    denied` was accepted as granted. Both row orders must be rejected."""
+    text = (
+        "Site: http://x\nAllowed-Paths: /a/\nPurpose: demo\n"
+        "Permission: granted\nPermission: denied\n"
+    )
+    grant = parse_permission(text)
+    assert grant.ok is False
+    assert grant.reason == "duplicate_field:Permission"
+
+
+def test_parse_permission_rejects_conflicting_duplicate_permission_denied_then_granted():
+    text = (
+        "Site: http://x\nAllowed-Paths: /a/\nPurpose: demo\n"
+        "Permission: denied\nPermission: granted\n"
+    )
+    grant = parse_permission(text)
+    assert grant.ok is False
+    assert grant.reason == "duplicate_field:Permission"
+
+
+def test_parse_permission_rejects_malformed_allowed_path_instead_of_repairing_it():
+    grant = parse_permission("Site: http://x\nAllowed-Paths: catalogue/\nPurpose: demo\nPermission: granted\n")
+    assert grant.ok is False
+    assert grant.reason == "malformed_allowed_path"
+
+
 def test_fixture_denied_permission_refuses_full_crawl():
     """End-to-end version against the real fixture server: permission_mode
     'denied' must refuse before a single catalogue page is fetched."""

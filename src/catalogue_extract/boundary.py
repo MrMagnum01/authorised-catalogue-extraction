@@ -12,6 +12,7 @@ from __future__ import annotations
 import ipaddress
 import posixpath
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -40,7 +41,10 @@ class Scope:
         parts = urlsplit(origin)
         if not parts.scheme or not parts.hostname or parts.username or parts.password:
             raise BoundaryError("malformed_origin", origin)
-        port = parts.port or DEFAULT_PORTS.get(parts.scheme)
+        try:
+            port = parts.port or DEFAULT_PORTS.get(parts.scheme)
+        except ValueError:
+            raise BoundaryError("malformed_origin", origin)
         if port is None:
             raise BoundaryError("malformed_origin", origin)
         try:
@@ -55,7 +59,7 @@ class Scope:
         return cls(scheme=parts.scheme, host=parts.hostname.lower(), port=port, allowed_prefixes=prefixes)
 
 
-def _normalize_path(raw_path: str) -> str:
+def normalize_path(raw_path: str) -> str:
     """Percent-decode then collapse dot-segments, catching encoded traversal."""
     decoded = unquote(raw_path)
     if "\x00" in decoded:
@@ -68,7 +72,10 @@ def _normalize_path(raw_path: str) -> str:
     return normalized
 
 
-def check_in_scope(url: str, scope: Scope, *, require_prefix: bool = True) -> str:
+def check_in_scope(
+    url: str, scope: Scope, *, require_prefix: bool = True,
+    allowed_exact_paths: Optional[frozenset] = None,
+) -> str:
     """Return the normalized in-scope path, or raise BoundaryError.
 
     `require_prefix=False` validates the exact scheme/host/port (and
@@ -79,6 +86,12 @@ def check_in_scope(url: str, scope: Scope, *, require_prefix: bool = True) -> st
     paths but must still be the exact, single authorised origin — not a
     same-prefix string match, which a port like `:12345` can spoof
     against an allowed `:1234`.
+
+    When `require_prefix=False` and `allowed_exact_paths` is given, the
+    normalized path must equal one of those exact paths — otherwise a
+    control endpoint redirecting to an arbitrary same-origin path (e.g.
+    PERMISSION.md 302-ing somewhere unrelated) would still pass a bare
+    origin check.
     """
     parts = urlsplit(url)
     if parts.username is not None or parts.password is not None:
@@ -89,13 +102,18 @@ def check_in_scope(url: str, scope: Scope, *, require_prefix: bool = True) -> st
         raise BoundaryError("scheme_mismatch", url)
     if not parts.hostname or parts.hostname.lower() != scope.host:
         raise BoundaryError("host_mismatch", url)
-    port = parts.port or DEFAULT_PORTS.get(parts.scheme)
+    try:
+        port = parts.port or DEFAULT_PORTS.get(parts.scheme)
+    except ValueError:
+        raise BoundaryError("malformed_port", url)
     if port != scope.port:
         raise BoundaryError("port_mismatch", url)
-    normalized = _normalize_path(parts.path or "/")
+    normalized = normalize_path(parts.path or "/")
     if normalized.startswith("/..") or normalized == "..":
         raise BoundaryError("path_traversal", url)
     if not require_prefix:
+        if allowed_exact_paths is not None and normalized not in allowed_exact_paths:
+            raise BoundaryError("control_path_out_of_scope", url)
         return normalized
     if not any(normalized == p or normalized.startswith(p.rstrip("/") + "/") or normalized == p.rstrip("/")
                for p in scope.allowed_prefixes):
@@ -115,7 +133,7 @@ def canonical_url(url: str) -> str:
     """Canonical key for dedup: scheme, host, port, normalized path, sorted query."""
     parts = urlsplit(url)
     port = parts.port or DEFAULT_PORTS.get(parts.scheme, 0)
-    path = _normalize_path(parts.path or "/")
+    path = normalize_path(parts.path or "/")
     query_pairs = sorted(
         pair.split("=", 1) if "=" in pair else (pair, "")
         for pair in parts.query.split("&") if pair

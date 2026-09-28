@@ -2,7 +2,7 @@ from pathlib import Path
 
 import httpx
 
-from catalogue_extract.boundary import Scope
+from catalogue_extract.boundary import Scope, canonical_url
 from catalogue_extract.crawl import CrawlConfig, run_crawl
 from catalogue_extract.diff import compute_diff
 from catalogue_extract.snapshot import load_current, load_current_id, load_generation, publish
@@ -190,6 +190,32 @@ def test_diff_rejects_mismatched_allowed_prefixes(tmp_path: Path):
     result = compute_diff(old, mutated)
     assert result["status"] == "INDETERMINATE"
     assert "allowed_paths_mismatch" in result["diagnostics"]
+
+
+def test_raw_response_artifacts_retained_per_fetch(tmp_path: Path):
+    """Astra HOLD r2, group7: the generation JSON used to serialize only
+    hashes/metadata, with no way to independently verify a fetch's raw
+    bytes. Every fetch attempt with an actual HTTP response must now
+    also retain a header subset and the raw body, addressable by hash,
+    under the generation's own `blobs/` directory."""
+    a = FixtureProduct("SKU-A", "Alpha", 1000, "USD", "Widgets")
+    state = FixtureState(products=[a])
+    with FixtureServer(state) as server:
+        scope = Scope.from_origin(server.origin, ["/catalogue"])
+        result = _crawl(server, scope)
+        publish(tmp_path, result)
+    assert result.status == "complete"
+
+    generation = load_generation(tmp_path, result.crawl_id)
+    seed_page = generation["pages"][canonical_url(server.origin + "/catalogue/")]
+    attempt = seed_page["attempts"][0]
+    assert attempt["status_code"] == 200
+    assert attempt["response_headers"].get("content-type", "").startswith("text/html")
+    assert attempt["body_sha256"]
+
+    blob_path = tmp_path / "generations" / result.crawl_id / "blobs" / f"{attempt['body_sha256']}.bin"
+    assert blob_path.exists()
+    assert blob_path.read_bytes()
 
 
 def test_failed_crawl_then_successful_retry_only_second_becomes_current(tmp_path: Path):

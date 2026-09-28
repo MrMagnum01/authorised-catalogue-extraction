@@ -22,11 +22,12 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import PARSER_VERSION
-from .boundary import Scope, canonical_url, is_in_scope
+from .boundary import Scope, canonical_url, is_in_scope, normalize_path
 from .fetch import FetchResult, fetch_resource
 from .models import PageOutcome, Product, RawProductRecord
 from .parse import parse_detail, parse_listing
@@ -87,6 +88,7 @@ class CrawlResult:
     end_snapshot: Optional[dict] = None
     pages: dict = field(default_factory=dict)
     out_of_scope_urls: set = field(default_factory=set)
+    required_out_of_scope_urls: set = field(default_factory=set)
     accounting: Accounting = field(default_factory=Accounting)
     products: list = field(default_factory=list)
     rejected: list = field(default_factory=list)
@@ -99,18 +101,27 @@ class CrawlResult:
 def _control_fetch(
     client: httpx.Client, url: str, scope: Scope,
     rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
+    allowed_exact_paths: frozenset,
 ) -> FetchResult:
     """Guarded single-attempt fetch for permission/robots/snapshot-meta:
     exact-origin boundary check, shared pacing, response-size cap and a
     bounded, revalidated redirect chain — but no retry, since a control
     endpoint's own transient error must refuse the run, not be retried
-    away."""
+    away.
+
+    `allowed_exact_paths` binds every hop (initial request and any
+    redirect) to this crawl's own fixed control paths — permission,
+    robots.txt, snapshot-meta — so a control endpoint can't redirect to
+    some other arbitrary same-origin path and still pass the bare
+    exact-origin check `require_prefix=False` alone would allow.
+    """
     return fetch_resource(
         client, url, scope, rate_limiter, retry_budget,
         max_attempts=1, max_redirects=config.max_redirects,
         max_response_bytes=config.max_response_bytes,
         connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
         user_agent=config.user_agent, require_prefix=False,
+        allowed_exact_paths=allowed_exact_paths,
     )
 
 
@@ -167,6 +178,10 @@ def run_crawl(
     accounting = Accounting()
     rate_limiter = RateLimiter(config.min_interval_s, config.jitter_s)
     retry_budget = RetryBudget(config.retry_budget_s)
+    control_paths = frozenset(
+        normalize_path(urlsplit(u).path or "/")
+        for u in (permission_url, robots_url, snapshot_meta_url)
+    )
 
     def refuse(reasons: list[str], **overrides) -> CrawlResult:
         fields = dict(
@@ -180,7 +195,7 @@ def run_crawl(
 
     # --- Permission: a validated grant, not just a 200 status. ---
     accounting.control_requests += 1
-    presp = _control_fetch(client, permission_url, scope, rate_limiter, retry_budget, config)
+    presp = _control_fetch(client, permission_url, scope, rate_limiter, retry_budget, config, control_paths)
     if not presp.ok:
         return refuse([f"permission_{_control_failure_reason(presp)}"])
     permission_sha256 = hashlib.sha256(presp.content).hexdigest()
@@ -205,7 +220,7 @@ def run_crawl(
     accounting.control_requests += 1
     robots_fetched_at = _now_iso()
     robots = _robots_from_control_fetch(
-        _control_fetch(client, robots_url, scope, rate_limiter, retry_budget, config), robots_fetched_at,
+        _control_fetch(client, robots_url, scope, rate_limiter, retry_budget, config, control_paths), robots_fetched_at,
     )
     if not robots.ok:
         return refuse([f"robots_{robots.reason}"],
@@ -215,7 +230,7 @@ def run_crawl(
 
     # --- Snapshot metadata: typed, required, used for completeness reconciliation. ---
     accounting.control_requests += 1
-    start_snapshot, start_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config)
+    start_snapshot, start_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths)
     if start_snapshot is None:
         return refuse([f"snapshot_meta_{start_err}"],
                        permission_sha256=permission_sha256, permission_fetched_at=permission_fetched_at,
@@ -224,6 +239,7 @@ def run_crawl(
 
     pages: dict[str, PageOutcome] = {}
     out_of_scope: set = set()
+    required_out_of_scope: set = set()
     raw_products: list[RawProductRecord] = []
     queue: list[tuple] = [(seed_listing_url, "listing")]
     queued_canon = {canonical_url(seed_listing_url)}
@@ -281,6 +297,7 @@ def run_crawl(
                         queue.append((abs_url, "detail"))
                 else:
                     out_of_scope.add(abs_url)
+                    required_out_of_scope.add(abs_url)
             if listing.next_link:
                 abs_next = str(httpx.URL(result.final_url).join(listing.next_link))
                 if is_in_scope(abs_next, scope):
@@ -290,6 +307,20 @@ def run_crawl(
                         queue.append((abs_next, "listing"))
                 else:
                     out_of_scope.add(abs_next)
+                    required_out_of_scope.add(abs_next)
+            # `related` links are optional/unrelated (teaser links, or the
+            # fixture's own bait links probing for scope escapes): still
+            # followed when in-scope, but one resolving out of scope is
+            # never a completeness failure the way a required link is.
+            for link in listing.related_links:
+                abs_url = str(httpx.URL(result.final_url).join(link))
+                if is_in_scope(abs_url, scope):
+                    c = canonical_url(abs_url)
+                    if c not in queued_canon:
+                        queued_canon.add(c)
+                        queue.append((abs_url, "detail"))
+                else:
+                    out_of_scope.add(abs_url)
         else:
             # `url` (the original, pre-redirect queue entry) is recorded as the
             # record's source_url so it matches the canonical key `pages` is
@@ -306,7 +337,7 @@ def run_crawl(
     accounting.discovered_in_scope = len(pages)
 
     accounting.control_requests += 1
-    end_snapshot, end_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config)
+    end_snapshot, end_err = _fetch_snapshot_meta(client, snapshot_meta_url, scope, rate_limiter, retry_budget, config, control_paths)
 
     products, rejected, conflicting, exact_dup_count = _resolve_products(raw_products)
 
@@ -323,6 +354,8 @@ def run_crawl(
         reasons.append("unattempted_limit_pages")
     if accounting.skipped_by_robots:
         reasons.append("robots_denied_pages")
+    if required_out_of_scope:
+        reasons.append("required_link_out_of_scope")
     if end_snapshot is None or start_snapshot != end_snapshot:
         reasons.append("snapshot_changed_mid_crawl" if end_err is None else f"snapshot_meta_{end_err}")
 
@@ -343,7 +376,8 @@ def run_crawl(
         permission_fetched_at=permission_fetched_at, permission_site=grant.site,
         permission_allowed_paths=grant.allowed_paths, permission_purpose=grant.purpose, robots=robots,
         start_snapshot=start_snapshot, end_snapshot=end_snapshot, pages=pages,
-        out_of_scope_urls=out_of_scope, accounting=accounting, products=products,
+        out_of_scope_urls=out_of_scope, required_out_of_scope_urls=required_out_of_scope,
+        accounting=accounting, products=products,
         rejected=rejected, conflicting_ids=conflicting, exact_duplicates=exact_dup_count,
         expected_items=advertised_items,
     )
@@ -365,8 +399,9 @@ def _validate_snapshot_meta(meta: object) -> Optional[str]:
 def _fetch_snapshot_meta(
     client: httpx.Client, url: str, scope: Scope,
     rate_limiter: RateLimiter, retry_budget: RetryBudget, config: CrawlConfig,
+    allowed_exact_paths: frozenset,
 ) -> tuple[Optional[dict], Optional[str]]:
-    result = _control_fetch(client, url, scope, rate_limiter, retry_budget, config)
+    result = _control_fetch(client, url, scope, rate_limiter, retry_budget, config, allowed_exact_paths)
     if not result.ok:
         return None, _control_failure_reason(result)
     try:

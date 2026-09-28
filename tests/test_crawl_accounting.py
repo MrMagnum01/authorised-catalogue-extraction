@@ -174,6 +174,58 @@ def test_robots_rechecked_on_redirect_destination():
     assert len(result.products) == 1
 
 
+def test_required_out_of_scope_product_link_marks_incomplete_even_with_matching_counts():
+    """Astra HOLD r2, group4: an out-of-scope *required* (product/
+    pagination) link used to only ever land in `out_of_scope_urls` —
+    never affecting completeness on its own. A listing with a real
+    product link outside scope and advertised_items=0 used to report
+    complete, since nothing else caught it. Reconciliation must be
+    independent of the advertised counts happening to already match."""
+    origin = "http://127.0.0.1:1234"
+    scope = Scope.from_origin(origin, ["/catalogue/"])
+    grant = "Site: {0}\nAllowed-Paths: /catalogue/\nPurpose: demo\nPermission: granted\n".format(origin)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/PERMISSION.md":
+            return httpx.Response(200, text=grant)
+        if path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        if path == "/_meta/snapshot":
+            return httpx.Response(200, json={"snapshot_id": "s", "version": 1, "advertised_items": 0, "advertised_pages": 1})
+        return httpx.Response(
+            200,
+            text='<ul class="product-list"><a class="product-link" href="http://127.0.0.1:9999/catalogue/p">P</a></ul>',
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(transport), trust_env=False) as client:
+        result = run_crawl(
+            client, scope, origin + "/catalogue/", origin + "/PERMISSION.md",
+            origin + "/robots.txt", origin + "/_meta/snapshot",
+            CrawlConfig(min_interval_s=0, jitter_s=0),
+        )
+
+    assert result.status == "incomplete"
+    assert "required_link_out_of_scope" in result.reasons
+    assert any("9999" in u for u in result.required_out_of_scope_urls)
+
+
+def test_optional_related_link_out_of_scope_does_not_force_incomplete():
+    """The fixture's own bait `a.related` links resolving out of scope
+    (external hosts, credentials, encoded traversal, ...) are optional,
+    unrelated links — never required for a complete crawl, unlike a real
+    product/pagination link."""
+    state = FixtureState(products=generate_products(n=2), include_bait_links=True)
+    with FixtureServer(state) as other_server:
+        state.other_origin = other_server.origin
+        with FixtureServer(state) as server:
+            scope = Scope.from_origin(server.origin, ["/catalogue"])
+            result = _run(server, scope)
+    assert result.status == "complete"
+    assert result.accounting.out_of_scope_links >= 3
+    assert result.required_out_of_scope_urls == set()
+
+
 def test_advertised_item_count_overstated_marks_incomplete():
     """Astra HOLD group 4: the fixture's advertised item count is a claim
     to be reconciled, not just printed — a catalogue that advertises more

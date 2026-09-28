@@ -49,14 +49,23 @@ from .models import Money, RawProductRecord
 @dataclass
 class ListingParseResult:
     template: str  # "v1" | "v2" | "unrecognised"
-    product_links: list[str]
-    next_link: Optional[str]
+    product_links: list[str]  # required: catalogue product/detail links
+    related_links: list[str]  # optional: unrelated/teaser links, never required for completeness
+    next_link: Optional[str]  # required: pagination continuity
 
 
 def parse_listing(html: bytes, base_url: str) -> ListingParseResult:
     """Template is detected from the list *container*, not its items, so a
     valid empty page (zero products) still identifies as v1/v2 rather than
-    falling through to unrecognised."""
+    falling through to unrecognised.
+
+    `product_links` and `next_link` are the catalogue's own structure —
+    required for a complete crawl. `related_links` (`a.related`) are
+    unrelated/teaser links the fixture also renders (including bait
+    links probing for scope escapes); they are still followed when
+    in-scope, but one resolving out of scope never makes the crawl
+    incomplete the way a required link does.
+    """
     tree = HTMLParser(html)
     related = [a.attributes.get("href") for a in tree.css("a.related") if a.attributes.get("href")]
 
@@ -64,13 +73,13 @@ def parse_listing(html: bytes, base_url: str) -> ListingParseResult:
         links = [a.attributes.get("href") for a in tree.css("a.product-link") if a.attributes.get("href")]
         next_node = tree.css_first("a.next-page")
         next_link = next_node.attributes.get("href") if next_node else None
-        return ListingParseResult("v1", links + related, next_link)
+        return ListingParseResult("v1", links, related, next_link)
     if tree.css_first("ul.item-list") is not None:
         links = [a.attributes.get("href") for a in tree.css("a.item-link") if a.attributes.get("href")]
         next_node = tree.css_first("a.pager-next")
         next_link = next_node.attributes.get("href") if next_node else None
-        return ListingParseResult("v2", links + related, next_link)
-    return ListingParseResult("unrecognised", related, None)
+        return ListingParseResult("v2", links, related, next_link)
+    return ListingParseResult("unrecognised", [], related, None)
 
 
 def _content_hash(product_id: Optional[str], name: Optional[str], price: Optional[Money], category: Optional[str]) -> str:

@@ -35,7 +35,11 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     gen_path = publish(out_dir, result)
     print(f"crawl_id={result.crawl_id} status={result.status} reasons={result.reasons}")
     print(f"generation={gen_path}")
-    return 0 if result.status != "refused" else 2
+    if result.status == "refused":
+        return 2
+    if result.status == "incomplete":
+        return 1
+    return 0
 
 
 def cmd_diff(args: argparse.Namespace) -> int:

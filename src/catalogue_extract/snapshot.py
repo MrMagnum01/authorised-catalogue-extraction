@@ -13,6 +13,14 @@ single fixed filename per `out_dir`: this module assumes one writer
 temp file; this is a single-writer design, not a claim of safe
 concurrent publication, and there is no claim of power-loss durability
 beyond whatever `os.replace` already guarantees on the host filesystem.
+
+Every fetch attempt with an actual HTTP response also gets a raw
+artifact: a status code and a small header subset in the JSON itself,
+plus the raw response body written under `generations/<crawl_id>/blobs/
+<sha256>.bin`, deduplicated by content hash. The JSON only ever
+references the body by its hash — never inlines it — so the generation
+file stays small and diffable while the underlying bytes stay
+independently auditable.
 """
 from __future__ import annotations
 
@@ -62,6 +70,7 @@ def crawl_result_to_dict(result: CrawlResult) -> dict:
         "expected_items": result.expected_items,
         "exact_duplicates": result.exact_duplicates,
         "out_of_scope_urls": sorted(result.out_of_scope_urls),
+        "required_out_of_scope_urls": sorted(result.required_out_of_scope_urls),
         "pages": {
             canon: {
                 "url": p.url, "kind": p.kind, "outcome": p.outcome,
@@ -70,7 +79,8 @@ def crawl_result_to_dict(result: CrawlResult) -> dict:
                 "reason": p.reason,
                 "attempts": [
                     {"attempt_no": a.attempt_no, "url": a.url, "status_code": a.status_code,
-                     "error": a.error, "elapsed_s": a.elapsed_s, "waited_before_s": a.waited_before_s}
+                     "error": a.error, "elapsed_s": a.elapsed_s, "waited_before_s": a.waited_before_s,
+                     "response_headers": a.response_headers, "body_sha256": a.body_sha256}
                     for a in p.attempts
                 ],
             }
@@ -108,9 +118,23 @@ def crawl_result_to_dict(result: CrawlResult) -> dict:
     }
 
 
+def _write_blobs(gen_dir: Path, result: CrawlResult) -> None:
+    blobs_dir = gen_dir / "blobs"
+    for page in result.pages.values():
+        for attempt in page.attempts:
+            if attempt.body_sha256 is None or attempt.body is None:
+                continue
+            blob_path = blobs_dir / f"{attempt.body_sha256}.bin"
+            if blob_path.exists():
+                continue
+            blobs_dir.mkdir(parents=True, exist_ok=True)
+            blob_path.write_bytes(attempt.body)
+
+
 def save_generation(out_dir: Path, result: CrawlResult) -> Path:
     gen_dir = out_dir / "generations" / result.crawl_id
     gen_dir.mkdir(parents=True, exist_ok=True)
+    _write_blobs(gen_dir, result)
     gen_path = gen_dir / "generation.json"
     tmp_path = gen_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(crawl_result_to_dict(result), indent=2, sort_keys=True))

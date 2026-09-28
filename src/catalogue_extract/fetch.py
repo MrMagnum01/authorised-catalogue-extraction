@@ -1,23 +1,28 @@
 """Single-URL fetch with bounded retries and manually-revalidated redirects.
 
-httpx's `follow_redirects` is never enabled: every redirect hop is
-resolved with `urljoin`, re-checked against the scope boundary (and,
-for page fetches, robots), and tracked against a loop/visited set
-before it is ever requested. A redirect that leaves scope terminates
-the fetch with a boundary refusal, not a followed request; a redirect
-into a robots-disallowed path terminates it with a robots refusal, not
-a followed request either.
+`follow_redirects=False` is passed explicitly on every request, so an
+injected or misconfigured `httpx.Client` (e.g. one built with
+`follow_redirects=True`) can never make httpx itself resolve a
+redirect — every hop is instead resolved with `urljoin`, re-checked
+against the scope boundary (and, for page fetches, robots), and
+tracked against a loop/visited set before it is ever requested. A
+redirect that leaves scope terminates the fetch with a boundary
+refusal, not a followed request; a redirect into a robots-disallowed
+path terminates it with a robots refusal, not a followed request
+either.
 
 Every retryable failure — a timeout, a transport error, or a
 429/5xx status — is charged against the same shared `RetryBudget`
 before it sleeps, and the wait it took is attributed to the *next*
 recorded attempt (`waited_before_s`), so no wait is ever spent off the
-books. If the wait would exceed the remaining budget the fetch fails
-immediately with `retry_budget_exceeded` rather than sleeping a
-truncated amount and retrying early.
+books. The budget's real monotonic deadline is also rechecked
+immediately before every dispatch (not just before a backoff sleep),
+so a slow-but-not-erroring response that itself burns the whole budget
+still stops the next retry from ever being sent.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -31,6 +36,11 @@ from .robots import RobotsResult, can_fetch
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 REDIRECT_STATUS = {301, 302, 303, 307, 308}
+RESPONSE_HEADER_ALLOWLIST = {"content-type", "content-length", "location", "retry-after"}
+
+
+def _header_subset(resp: httpx.Response) -> dict:
+    return {k: v for k, v in resp.headers.items() if k.lower() in RESPONSE_HEADER_ALLOWLIST}
 
 
 @dataclass
@@ -61,20 +71,24 @@ def fetch_resource(
     user_agent: str = "catalogue-extract-demo/1.0",
     require_prefix: bool = True,
     robots: Optional[RobotsResult] = None,
+    allowed_exact_paths: Optional[frozenset] = None,
 ) -> FetchResult:
     """Fetch `url`, following redirects manually.
 
     `require_prefix=False` is used for the fixed control endpoints
     (permission, robots.txt, snapshot-meta): they must still be the
     exact, single authorised origin, but are not required to fall under
-    the crawl's own `allowed_prefixes`.
+    the crawl's own `allowed_prefixes`. `allowed_exact_paths`, when
+    given alongside it, further binds those control fetches (including
+    their redirect hops) to the crawl's known fixed control paths, so a
+    control endpoint can't redirect to an arbitrary same-origin path.
 
     `robots`, when given, is rechecked against every hop (including the
     first) before it is requested — a redirect into a disallowed path is
     refused with `robots_denied=True`, not followed.
     """
     try:
-        check_in_scope(url, scope, require_prefix=require_prefix)
+        check_in_scope(url, scope, require_prefix=require_prefix, allowed_exact_paths=allowed_exact_paths)
     except BoundaryError as e:
         return FetchResult(False, url, None, None, [], f"boundary:{e.reason}", [url], e.reason)
     if robots is not None and not can_fetch(robots, url, user_agent):
@@ -95,9 +109,16 @@ def fetch_resource(
             rl_wait = rate_limiter.wait()
             waited_before = rl_wait + carried_wait
             carried_wait = 0.0
-            start = time.monotonic()
+            now = time.monotonic()
+            retry_budget.mark_start(now)
+            if retry_budget.expired(now):
+                return FetchResult(False, current_url, None, None, attempts, "failed:retry_budget_exceeded", redirect_chain)
+            start = now
             try:
-                resp = client.get(current_url, headers={"User-Agent": user_agent}, timeout=timeout)
+                resp = client.get(
+                    current_url, headers={"User-Agent": user_agent}, timeout=timeout,
+                    follow_redirects=False,
+                )
             except httpx.TimeoutException:
                 elapsed = time.monotonic() - start
                 attempts.append(FetchAttempt(global_attempt, current_url, None, "timeout", elapsed, waited_before))
@@ -125,7 +146,12 @@ def fetch_resource(
 
             elapsed = time.monotonic() - start
             status = resp.status_code
-            attempts.append(FetchAttempt(global_attempt, current_url, status, None, elapsed, waited_before))
+            body = resp.content
+            body_sha256 = hashlib.sha256(body).hexdigest() if body else None
+            attempts.append(FetchAttempt(
+                global_attempt, current_url, status, None, elapsed, waited_before,
+                response_headers=_header_subset(resp), body_sha256=body_sha256, body=body,
+            ))
 
             if status in REDIRECT_STATUS:
                 break  # handled by outer loop
@@ -143,7 +169,7 @@ def fetch_resource(
                 carried_wait = wait_s
                 continue
             if 200 <= status < 300:
-                content = resp.content
+                content = body
                 if len(content) > max_response_bytes:
                     return FetchResult(False, current_url, status, None, attempts, "failed:response_too_large", redirect_chain)
                 return FetchResult(True, current_url, status, content, attempts, None, redirect_chain)
@@ -155,7 +181,7 @@ def fetch_resource(
             return FetchResult(False, current_url, status, None, attempts, "failed:redirect_no_location", redirect_chain)
         next_url = str(httpx.URL(current_url).join(location))
         try:
-            check_in_scope(next_url, scope, require_prefix=require_prefix)
+            check_in_scope(next_url, scope, require_prefix=require_prefix, allowed_exact_paths=allowed_exact_paths)
         except BoundaryError as e:
             return FetchResult(False, current_url, status, None, attempts, f"boundary:{e.reason}", redirect_chain, e.reason)
         if robots is not None and not can_fetch(robots, next_url, user_agent):

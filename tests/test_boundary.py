@@ -95,3 +95,31 @@ def test_canonical_url_dedupes_default_port():
 def test_no_allowed_prefixes_rejected():
     with pytest.raises(BoundaryError):
         Scope.from_origin("http://127.0.0.1:8000", [])
+
+
+def test_malformed_port_is_a_categorised_boundary_error_not_a_bare_valueerror(scope):
+    """Astra HOLD r2, group1: a malformed port used to raise a plain
+    ValueError straight out of urlsplit's `.port` property, which
+    `fetch_resource`'s `except BoundaryError` could never catch — an
+    uncaught exception, not a refused/categorised run. It must now come
+    back as a `BoundaryError` with a specific reason."""
+    with pytest.raises(BoundaryError) as exc:
+        check_in_scope("http://127.0.0.1:broken/catalogue/", scope)
+    assert exc.value.reason == "malformed_port"
+
+
+def test_control_path_exact_binding_rejects_other_same_origin_paths(scope):
+    """Astra HOLD r2, group1: `require_prefix=False` alone only checks the
+    exact origin — any path on that origin passes. A control fetch must
+    additionally bind to its own fixed set of control paths, so a
+    same-origin redirect to something else is refused, not allowed
+    through."""
+    allowed = frozenset({"/PERMISSION.md"})
+    assert check_in_scope(
+        "http://127.0.0.1:8000/PERMISSION.md", scope, require_prefix=False, allowed_exact_paths=allowed,
+    ) == "/PERMISSION.md"
+    with pytest.raises(BoundaryError) as exc:
+        check_in_scope(
+            "http://127.0.0.1:8000/admin/secret", scope, require_prefix=False, allowed_exact_paths=allowed,
+        )
+    assert exc.value.reason == "control_path_out_of_scope"

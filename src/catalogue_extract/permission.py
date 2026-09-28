@@ -17,9 +17,13 @@ ignored; keys are case-sensitive and each required exactly once):
     Purpose: <free text, non-empty>
     Permission: granted
 
-Anything else — a missing key, an empty value, `Permission: denied` (or
-any value other than `granted`), a `Site` that doesn't match the exact
-origin being crawled — fails validation. This is this demo's own
+Anything else — a missing key, an empty value, a required key repeated
+(whether the repeat agrees or conflicts — a grant that says both
+`Permission: granted` and `Permission: denied` is not a clean grant,
+even if the first line is read as authoritative), a malformed
+`Allowed-Paths` entry not starting with `/`, `Permission: denied` (or
+any value other than `granted`), or a `Site` that doesn't match the
+exact origin being crawled — fails validation. This is this demo's own
 grammar, invented for this repository; it is not a claim about any
 real-world permission-file standard.
 """
@@ -43,6 +47,7 @@ class PermissionGrant:
 
 def parse_permission(text: str) -> PermissionGrant:
     fields: dict[str, str] = {}
+    duplicate_keys: set[str] = set()
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -51,8 +56,14 @@ def parse_permission(text: str) -> PermissionGrant:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in REQUIRED_KEYS and key not in fields:
-            fields[key] = value.strip()
+        if key in REQUIRED_KEYS:
+            if key in fields:
+                duplicate_keys.add(key)
+            else:
+                fields[key] = value.strip()
+
+    if duplicate_keys:
+        return PermissionGrant(False, f"duplicate_field:{'+'.join(sorted(duplicate_keys))}")
 
     missing = [k for k in REQUIRED_KEYS if not fields.get(k)]
     if missing:
@@ -61,13 +72,12 @@ def parse_permission(text: str) -> PermissionGrant:
     if fields["Permission"].lower() != "granted":
         return PermissionGrant(False, "not_granted")
 
-    allowed_paths = tuple(
-        p.strip() if p.strip().startswith("/") else f"/{p.strip()}"
-        for p in fields["Allowed-Paths"].split(",")
-        if p.strip()
-    )
-    if not allowed_paths:
+    raw_paths = [p.strip() for p in fields["Allowed-Paths"].split(",") if p.strip()]
+    if not raw_paths:
         return PermissionGrant(False, "missing_field:Allowed-Paths")
+    if any(not p.startswith("/") for p in raw_paths):
+        return PermissionGrant(False, "malformed_allowed_path")
+    allowed_paths = tuple(raw_paths)
 
     return PermissionGrant(
         ok=True, reason=None,

@@ -42,6 +42,9 @@ class FetchAttempt:
     error: Optional[str]
     elapsed_s: float
     waited_before_s: float
+    response_headers: dict = field(default_factory=dict)
+    body_sha256: Optional[str] = None
+    body: Optional[bytes] = field(default=None, repr=False)
 
 
 @dataclass

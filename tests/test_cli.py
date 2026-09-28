@@ -47,6 +47,18 @@ def test_cli_crawl_export_and_diff_roundtrip(tmp_path: Path):
     assert "product_id" in csv_path.read_text().splitlines()[0]
 
 
+def test_cli_crawl_returns_nonzero_for_incomplete_crawl(tmp_path: Path):
+    """Astra HOLD r2, group5: an incomplete (but not refused) crawl used
+    to still exit 0 — automation could not tell a clean run apart from
+    one that quietly under-delivered without re-parsing the printed
+    status. `refused` -> 2, `incomplete` -> 1, `complete` -> 0."""
+    state = FixtureState(products=generate_products(n=1), advertised_items_override=99)
+    with FixtureServer(state) as server:
+        out_dir = tmp_path / "run"
+        rc = main(["crawl", "--origin", server.origin, "--allow", "/catalogue", "--out", str(out_dir)])
+    assert rc == 1
+
+
 def test_cli_diff_returns_nonzero_for_indeterminate_result(tmp_path: Path):
     """Astra HOLD group 5: automation must be able to tell an INDETERMINATE
     diff apart from a real one by exit code alone, not just by re-parsing
